@@ -161,3 +161,48 @@ def test_webhook_uses_bangkok_date_and_ignores_group_messages(webhook_client):
         assert items[0].occurred_on == date(2026, 9, 13)
         assert items[0].amount_satang == 4000
     assert [reply[0] for reply in replies] == ["reply-evt-boundary"]
+
+
+def test_natural_language_entry_records_item_for_correct_user(webhook_client):
+    client, engine, replies = webhook_client
+    payload = {
+        "events": [
+            _text_event("evt-natural-a", "U-alice", "ข้าวมันไก่ 50"),
+            _text_event("evt-natural-b", "U-bob", "เงินเดือน 20000"),
+        ]
+    }
+    body, headers = _signed_body(payload)
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [
+            (
+                item.line_user_id,
+                item.transaction_type,
+                item.amount_satang,
+                item.category,
+                item.description,
+            )
+            for item in items
+        ] == [
+            ("U-alice", "expense", 5000, "อาหาร", "ข้าวมันไก่"),
+            ("U-bob", "income", 2_000_000, "เงินเดือน", "เงินเดือน"),
+        ]
+    assert "รายการ: ข้าวมันไก่" in replies[0][1]
+    assert "หมวด: อาหาร" in replies[0][1]
+    assert "รายการ: เงินเดือน" in replies[1][1]
+
+
+def test_ambiguous_natural_language_does_not_write_transaction(webhook_client):
+    client, engine, replies = webhook_client
+    body, headers = _signed_body(
+        {"events": [_text_event("evt-amount-only", "U-alice", "500")]}
+    )
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+    assert "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย" in replies[0][1]

@@ -125,6 +125,7 @@ def handle_text_message(
             command.kind.value,
             command.amount,
             command.category,
+            description=command.description,
             occurred_on=command.transaction_date,
             session=session,
         )

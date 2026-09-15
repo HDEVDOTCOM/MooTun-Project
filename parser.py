@@ -1,7 +1,8 @@
 """Rule-based Thai command parser for MooToon.
 
-The parser deliberately does not call an LLM.  It only returns a transaction
-when both its direction and amount can be established from the message.
+The parser deliberately does not call an LLM.  It accepts an explicit
+income/expense verb or a strong deterministic taxonomy match, and leaves
+messages unresolved when their type or amount is still ambiguous.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import TypeAlias
 from zoneinfo import ZoneInfo
+
+from taxonomy import TransactionType, classify_item, fallback_category
 
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
@@ -38,6 +41,8 @@ class TransactionCommand:
     amount: Decimal
     category: str
     transaction_date: date
+    description: str
+    inference_rule: str
 
 
 @dataclass(frozen=True)
@@ -76,7 +81,45 @@ ParsedCommand: TypeAlias = (
 _AMOUNT_PATTERN = r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d.])"
 _EXPENSE_WORDS = ("รายจ่าย", "จ่าย", "ซื้อ", "เสีย")
 _INCOME_WORDS = ("รายรับ", "ได้รับ", "เงินเข้า", "รับ")
-_TRANSACTION_WORDS = sorted(_EXPENSE_WORDS + _INCOME_WORDS, key=len, reverse=True)
+_ATTACHED_COMMAND_PREFIXES = {
+    "รับ": ("ค่า", "เงิน"),
+    "เสีย": ("ค่า", "เงิน"),
+}
+_NEGATED_TRANSACTION_PHRASES = (
+    "ไม่ได้ซื้อ",
+    "ไม่ได้จ่าย",
+    "ไม่ได้รับ",
+    "ไม่ซื้อ",
+    "ไม่จ่าย",
+    "ไม่รับ",
+    "ไม่ขาย",
+    "ไม่เคยซื้อ",
+    "ไม่เคยจ่าย",
+    "ไม่เคยรับ",
+    "ไม่เคยขาย",
+    "ยังไม่ได้",
+    "ยกเลิก",
+)
+_FUTURE_TRANSACTION_PHRASES = (
+    "พรุ่งนี้",
+    "มะรืน",
+    "จะซื้อ",
+    "จะจ่าย",
+    "จะได้รับ",
+    "จะได้เงิน",
+    "จะขาย",
+    "กำลังจะซื้อ",
+    "กำลังจะจ่าย",
+    "กำลังจะรับ",
+    "กำลังจะขาย",
+    "วางแผนซื้อ",
+    "วางแผนจ่าย",
+    "วางแผนรับ",
+    "วางแผนขาย",
+    "สัปดาห์หน้า",
+    "เดือนหน้า",
+    "ปีหน้า",
+)
 
 
 def _local_date(now: datetime | date | None) -> date:
@@ -105,6 +148,26 @@ def _extract_amount(text: str) -> tuple[Decimal | None, str, int]:
     value = _amount(match.group())
     cleaned = f"{text[:match.start()]} {text[match.end():]}"
     return value, cleaned, 1
+
+
+def _invalid_amount_reason(text: str) -> str | None:
+    if re.search(rf"(?<![\d/])[-−]\s*{_AMOUNT_PATTERN}", text):
+        return "จำนวนเงินต้องมากกว่า 0"
+    if re.search(r"(?<!\d)\d+\.\d{3,}(?!\d)", text):
+        return "จำนวนเงินมีทศนิยมได้ไม่เกิน 2 ตำแหน่ง"
+    if re.search(r"(?<![\d,])\d{1,3},\d{1,2}(?!\d)", text):
+        return "รูปแบบจำนวนเงินไม่ถูกต้อง"
+    numeric_fragments = re.findall(
+        r"(?<![\d.,])(?:[.,]\d+|\d[\d.,]*)(?![\d.,])",
+        text,
+    )
+    for fragment in numeric_fragments:
+        if ("." in fragment or "," in fragment) and not re.fullmatch(
+            _AMOUNT_PATTERN,
+            fragment,
+        ):
+            return "รูปแบบจำนวนเงินไม่ถูกต้อง"
+    return None
 
 
 def _parse_written_date(raw: str) -> date | None:
@@ -150,11 +213,31 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def _starts_with_command_word(text: str, words: tuple[str, ...]) -> bool:
-    """Match a leading verb without treating Thai substrings as commands."""
+def _display_text(text: str) -> str:
+    """Collapse whitespace while preserving the user's item capitalization."""
 
-    without_relative_date = re.sub(r"^(?:วันนี้|เมื่อวาน)\s*", "", text)
-    return any(without_relative_date.startswith(word) for word in words)
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def _leading_command_word(text: str, words: tuple[str, ...]) -> str | None:
+    """Return a leading verb without treating Thai substrings as commands."""
+
+    for word in sorted(words, key=len, reverse=True):
+        if not text.startswith(word):
+            continue
+        remainder = text[len(word) :]
+        attached_prefixes = _ATTACHED_COMMAND_PREFIXES.get(word)
+        if attached_prefixes is None:
+            return word
+        if (
+            not remainder
+            or remainder[0].isspace()
+            or remainder[0].isdigit()
+            or remainder.startswith(("แล้ว", "และ", "จากนั้น"))
+            or remainder.startswith(attached_prefixes)
+        ):
+            return word
+    return None
 
 
 def _contains_linked_second_command(
@@ -163,26 +246,24 @@ def _contains_linked_second_command(
     second_words: tuple[str, ...],
 ) -> bool:
     without_relative_date = re.sub(r"^(?:วันนี้|เมื่อวาน)\s*", "", text)
-    first = next(
-        (word for word in sorted(first_words, key=len, reverse=True) if without_relative_date.startswith(word)),
-        None,
-    )
+    first = _leading_command_word(without_relative_date, first_words)
     if first is None:
         return False
     remainder = without_relative_date[len(first) :]
-    second_pattern = "|".join(re.escape(word) for word in sorted(second_words, key=len, reverse=True))
-    return bool(re.match(rf"^(?:แล้ว|และ|จากนั้น)\s*(?:{second_pattern})", remainder))
+    for linked in re.finditer(r"(?:แล้ว|และ|จากนั้น)\s*", remainder):
+        if _leading_command_word(remainder[linked.end() :], second_words):
+            return True
+    return False
 
 
-def _strip_transaction_words(text: str) -> str:
+def _strip_transaction_words(text: str, leading_word: str | None = None) -> str:
     text = text.strip()
-    for word in _TRANSACTION_WORDS:
-        if text.startswith(word):
-            text = text[len(word) :]
-            break
+    if leading_word and text.startswith(leading_word):
+        text = text[len(leading_word) :]
     text = re.sub(r"\b(?:บาท|หมวด)\b", " ", text)
     cleaned = re.sub(r"\s+", " ", text).strip(" :-")
-    return re.sub(r"^ไป(?:\s+|$)", "", cleaned).strip()
+    cleaned = re.sub(r"^ไป(?:\s+|$)", "", cleaned).strip()
+    return re.sub(r"^(?:แล้ว|และ|จากนั้น)\s*", "", cleaned).strip()
 
 
 def _unresolved(reason: str, *, ambiguous: bool = True) -> UnresolvedCommand:
@@ -201,6 +282,7 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
     """
 
     normalized = _normalize(text)
+    display_text = _display_text(text)
     if not normalized:
         return _unresolved("ไม่มีข้อความให้ประมวลผล", ambiguous=False)
 
@@ -219,11 +301,13 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
 
     if normalized.startswith(("ตั้งเป้า ", "ตั้งเป้าหมาย ")):
         body = re.sub(r"^ตั้งเป้า(?:หมาย)?\s+", "", normalized)
+        if invalid_reason := _invalid_amount_reason(body):
+            return _unresolved(invalid_reason)
         amount, remainder, count = _extract_amount(body)
-        if count == 0 or amount is None:
-            return _unresolved("กรุณาระบุจำนวนเงินของเป้าหมาย")
         if count > 1:
             return _unresolved("พบจำนวนเงินมากกว่าหนึ่งค่า")
+        if count == 0 or amount is None:
+            return _unresolved("กรุณาระบุจำนวนเงินของเป้าหมาย")
         description = re.sub(r"\bบาท\b", " ", remainder).strip(" :-")
         if len(description) > 200:
             return _unresolved("ชื่อเป้าหมายยาวเกิน 200 ตัวอักษร")
@@ -231,48 +315,107 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
 
     if normalized.startswith(("ออม ", "เก็บเงิน ")):
         body = re.sub(r"^(?:ออม|เก็บเงิน)\s+", "", normalized)
+        if invalid_reason := _invalid_amount_reason(body):
+            return _unresolved(invalid_reason)
         amount, remainder, count = _extract_amount(body)
-        if count == 0 or amount is None:
-            return _unresolved("กรุณาระบุจำนวนเงินที่ออม")
         if count > 1:
             return _unresolved("พบจำนวนเงินมากกว่าหนึ่งค่า")
+        if count == 0 or amount is None:
+            return _unresolved("กรุณาระบุจำนวนเงินที่ออม")
         if re.sub(r"\bบาท\b", " ", remainder).strip(" :-"):
             return _unresolved("คำสั่งเพิ่มเงินออมมีข้อมูลที่ไม่รู้จัก")
         return SavingsProgressCommand(CommandKind.ADD_SAVINGS, amount)
 
-    expense = _starts_with_command_word(normalized, _EXPENSE_WORDS)
-    income = _starts_with_command_word(normalized, _INCOME_WORDS)
-    if expense and _contains_linked_second_command(normalized, _EXPENSE_WORDS, _INCOME_WORDS):
-        income = True
-    if income and _contains_linked_second_command(normalized, _INCOME_WORDS, _EXPENSE_WORDS):
-        expense = True
-    has_any_amount = bool(re.search(_AMOUNT_PATTERN, normalized))
-
-    if expense and income:
-        return _unresolved("พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน")
-    if not expense and not income:
-        if has_any_amount:
-            return _unresolved("กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
-        return _unresolved("ไม่รู้จักคำสั่ง", ambiguous=False)
+    if any(phrase in normalized for phrase in _NEGATED_TRANSACTION_PHRASES):
+        return _unresolved("ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก")
+    if any(phrase in normalized for phrase in _FUTURE_TRANSACTION_PHRASES):
+        return _unresolved("ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก")
 
     transaction_date, without_date, date_error = _extract_date(
         normalized, _local_date(now)
     )
     if date_error:
         return _unresolved(date_error)
+    _, display_without_date, _ = _extract_date(
+        display_text,
+        _local_date(now),
+    )
+
+    expense_word = _leading_command_word(without_date.strip(), _EXPENSE_WORDS)
+    income_word = _leading_command_word(without_date.strip(), _INCOME_WORDS)
+    expense = expense_word is not None
+    income = income_word is not None
+    if expense and _contains_linked_second_command(without_date.strip(), _EXPENSE_WORDS, _INCOME_WORDS):
+        income = True
+    if income and _contains_linked_second_command(without_date.strip(), _INCOME_WORDS, _EXPENSE_WORDS):
+        expense = True
+    if expense and income:
+        return _unresolved("พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน")
+
+    if invalid_reason := _invalid_amount_reason(without_date):
+        return _unresolved(invalid_reason)
 
     amount, without_amount, count = _extract_amount(without_date)
-    if count == 0 or amount is None:
-        return _unresolved("กรุณาระบุจำนวนเงิน")
+    _, display_without_amount, _ = _extract_amount(display_without_date)
     if count > 1:
         return _unresolved("พบจำนวนเงินมากกว่าหนึ่งค่า")
+    if count == 1 and amount is None:
+        return _unresolved("จำนวนเงินต้องมากกว่า 0")
+    if count == 0:
+        item_without_command = _strip_transaction_words(
+            display_without_date,
+            expense_word or income_word,
+        )
+        semantic = classify_item(item_without_command)
+        if expense or income or semantic is not None:
+            item_label = item_without_command.strip(" :-")
+            if item_label:
+                return _unresolved(f"กรุณาระบุจำนวนเงินของ {item_label}")
+            return _unresolved("กรุณาระบุจำนวนเงิน")
+        return _unresolved("ไม่รู้จักคำสั่ง", ambiguous=False)
+    leading_word = expense_word or income_word
+    description = _strip_transaction_words(display_without_amount, leading_word)
+    explicit_type: TransactionType | None = None
+    if expense:
+        explicit_type = "expense"
+    elif income:
+        explicit_type = "income"
 
-    category = _strip_transaction_words(without_amount) or "อื่นๆ"
+    semantic = classify_item(description, explicit_type=explicit_type)
+    if explicit_type is None and semantic is None:
+        return _unresolved("กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
+
+    transaction_type: TransactionType = (
+        explicit_type if explicit_type is not None else semantic.transaction_type
+    )
+    category = (
+        semantic.category
+        if semantic is not None
+        else fallback_category(transaction_type)
+    )
     if len(category) > 100:
         return _unresolved("ชื่อหมวดยาวเกิน 100 ตัวอักษร")
-    kind = CommandKind.EXPENSE if expense else CommandKind.INCOME
+    if len(description) > 500:
+        return _unresolved("ชื่อรายการยาวเกิน 500 ตัวอักษร")
+    kind = (
+        CommandKind.EXPENSE
+        if transaction_type == "expense"
+        else CommandKind.INCOME
+    )
+    inference_rule = (
+        f"explicit.{leading_word}"
+        if explicit_type is not None
+        else semantic.rule_id
+    )
     assert transaction_date is not None
-    return TransactionCommand(kind, amount, category, transaction_date)
+    return TransactionCommand(
+        kind,
+        amount,
+        category,
+        transaction_date,
+        description or "ไม่ระบุรายการ",
+        inference_rule,
+    )
 
 
 __all__ = [

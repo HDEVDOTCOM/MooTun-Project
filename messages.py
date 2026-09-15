@@ -63,14 +63,16 @@ def format_transaction_confirmation(transaction: Mapping[str, object]) -> str:
 
     lines = [
         f"✅ บันทึก{kind}แล้ว",
+    ]
+    note = _clean(transaction.get("note"), "")
+    if note and note != "ไม่ระบุรายการ":
+        lines.append(f"รายการ: {note}")
+    lines.extend([
         f"จำนวน: {format_amount(amount)} บาท",
         f"หมวด: {category}",
-    ]
+    ])
     if happened_on:
         lines.append(f"วันที่: {happened_on}")
-    note = _clean(transaction.get("note"), "")
-    if note:
-        lines.append(f"รายละเอียด: {note}")
     lines.append("พิมพ์ “ลบล่าสุด” หากบันทึกผิด")
     return limit_line_text("\n".join(lines))
 
@@ -87,7 +89,7 @@ def format_recent_transactions(
 
     items = list(transactions)[:limit]
     if not items:
-        return "ยังไม่มีรายการรายรับรายจ่าย ลองพิมพ์ “จ่าย 50 ค่าอาหาร”"
+        return "ยังไม่มีรายการรายรับรายจ่าย ลองพิมพ์ “ข้าว 50”"
 
     lines = ["🧾 รายการล่าสุด"]
     for index, item in enumerate(items, start=1):
@@ -172,8 +174,9 @@ def format_unknown_message(reason: str | None = None) -> str:
     heading = _clean(reason, "ยังไม่เข้าใจข้อความนี้")
     return (
         f"{heading}\nลองพิมพ์ เช่น\n"
-        "• จ่าย 50 ค่าอาหาร\n"
-        "• รับ 500 ค่าขนม\n"
+        "• ข้าว 50\n"
+        "• เงินเดือน 20000\n"
+        "• จ่าย 500\n"
         "• สรุปเดือนนี้\n\n"
         "พิมพ์ “ช่วยเหลือ” เพื่อดูคำสั่งทั้งหมด"
     )
@@ -182,8 +185,10 @@ def format_unknown_message(reason: str | None = None) -> str:
 def format_help_message() -> str:
     return (
         "🐷 วิธีใช้หมูตุ๋น\n\n"
-        "จดรายจ่าย: จ่าย 50 ค่าอาหาร\n"
-        "จดรายรับ: รับ 500 ค่าขนม\n"
+        "พิมพ์รายการและจำนวนเงินได้เลย\n"
+        "จดรายจ่าย: ข้าว 50 หรือ BTS 47\n"
+        "จดรายรับ: เงินเดือน 20000 หรือ แม่ให้ 500\n"
+        "ระบุเองได้: จ่าย 50 หรือ รับ 500\n"
         "ดูรายการ: รายการล่าสุด\n"
         "ดูสรุป: สรุปเดือนนี้\n"
         "ลบรายการ: ลบล่าสุด\n"

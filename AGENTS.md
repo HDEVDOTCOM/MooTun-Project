@@ -11,8 +11,9 @@
 
 Single flat package (no subdirectories): `app.py` (FastAPI webhook + command dispatch) →
 `parser.py` (rule-based Thai parser, no LLM; returns frozen dataclasses; only emits a
-transaction when both direction and amount are unambiguous) → `repository.py` (all DB
-access, scoped per LINE user ID) → `messages.py` (Thai reply formatting).
+transaction when amount and direction can be resolved unambiguously, either explicitly
+or through deterministic semantic rules) → `repository.py` (all DB access, scoped per
+LINE user ID) → `messages.py` (Thai reply formatting).
 `line_api.py` handles signature verification and replies; `database.py`/`models.py`
 hold the SQLAlchemy engine and tables.
 
@@ -24,8 +25,12 @@ hold the SQLAlchemy engine and tables.
 - Money is stored as integer satang (`amount_satang`); parse with `Decimal`, never float.
 - Webhook: HMAC signature is verified against the raw request body before any DB write;
   every event is deduplicated via `processed_webhook_events`.
-- The parser must never guess: a missing amount or direction returns an
-  UnresolvedCommand, not a transaction.
+- The parser must never guess without sufficient evidence. Direction may be inferred
+  from explicit commands or deterministic semantic rules when unambiguous. If amount,
+  direction, or other required information cannot be resolved safely, return an
+  `UnresolvedCommand` rather than inventing a value.
+- Explicit transaction direction takes precedence over semantic inference when the
+  explicit command is valid and unambiguous.
 - Month boundaries and summaries use Asia/Bangkok; display years are B.E. (+543).
 
 ## Database quirks
