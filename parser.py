@@ -81,44 +81,22 @@ ParsedCommand: TypeAlias = (
 _AMOUNT_PATTERN = r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d.])"
 _EXPENSE_WORDS = ("รายจ่าย", "จ่าย", "ซื้อ", "เสีย")
 _INCOME_WORDS = ("รายรับ", "ได้รับ", "เงินเข้า", "รับ")
-_ATTACHED_COMMAND_PREFIXES = {
-    "รับ": ("ค่า", "เงิน"),
-    "เสีย": ("ค่า", "เงิน"),
+_INCOME_ACTION_WORDS = _INCOME_WORDS + ("ขาย",)
+_LEXICALIZED_NON_COMMAND_PREFIXES = {
+    "รับ": ("รับประทาน",),
+    "เสีย": ("เสียใจ",),
 }
-_NEGATED_TRANSACTION_PHRASES = (
-    "ไม่ได้ซื้อ",
-    "ไม่ได้จ่าย",
-    "ไม่ได้รับ",
-    "ไม่ซื้อ",
-    "ไม่จ่าย",
-    "ไม่รับ",
-    "ไม่ขาย",
-    "ไม่เคยซื้อ",
-    "ไม่เคยจ่าย",
-    "ไม่เคยรับ",
-    "ไม่เคยขาย",
-    "ยังไม่ได้",
-    "ยกเลิก",
+_TRANSACTION_ACTION_PATTERN = r"(?:ได้รับ|ได้เงิน|ซื้อ|จ่าย|รับ|ขาย)"
+_NEGATED_TRANSACTION_PATTERNS = (
+    rf"(?:ไม่ได้|ไม่เคย|ไม่)\s*{_TRANSACTION_ACTION_PATTERN}",
+    r"เงินเดือน\s*ยัง\s*ไม่\s*เข้า",
+    r"ยัง\s*ไม่ได้",
+    r"ยกเลิก",
 )
-_FUTURE_TRANSACTION_PHRASES = (
-    "พรุ่งนี้",
-    "มะรืน",
-    "จะซื้อ",
-    "จะจ่าย",
-    "จะได้รับ",
-    "จะได้เงิน",
-    "จะขาย",
-    "กำลังจะซื้อ",
-    "กำลังจะจ่าย",
-    "กำลังจะรับ",
-    "กำลังจะขาย",
-    "วางแผนซื้อ",
-    "วางแผนจ่าย",
-    "วางแผนรับ",
-    "วางแผนขาย",
-    "สัปดาห์หน้า",
-    "เดือนหน้า",
-    "ปีหน้า",
+_FUTURE_TRANSACTION_PATTERNS = (
+    rf"จะ\s*{_TRANSACTION_ACTION_PATTERN}",
+    rf"(?:กำลังจะ|วางแผน)\s*{_TRANSACTION_ACTION_PATTERN}",
+    r"(?:พรุ่งนี้|มะรืน|สัปดาห์หน้า|เดือนหน้า|ปีหน้า)",
 )
 
 
@@ -157,10 +135,7 @@ def _invalid_amount_reason(text: str) -> str | None:
         return "จำนวนเงินมีทศนิยมได้ไม่เกิน 2 ตำแหน่ง"
     if re.search(r"(?<![\d,])\d{1,3},\d{1,2}(?!\d)", text):
         return "รูปแบบจำนวนเงินไม่ถูกต้อง"
-    numeric_fragments = re.findall(
-        r"(?<![\d.,])(?:[.,]\d+|\d[\d.,]*)(?![\d.,])",
-        text,
-    )
+    numeric_fragments = re.findall(r"[.,]*\d[\d.,]*", text)
     for fragment in numeric_fragments:
         if ("." in fragment or "," in fragment) and not re.fullmatch(
             _AMOUNT_PATTERN,
@@ -225,17 +200,8 @@ def _leading_command_word(text: str, words: tuple[str, ...]) -> str | None:
     for word in sorted(words, key=len, reverse=True):
         if not text.startswith(word):
             continue
-        remainder = text[len(word) :]
-        attached_prefixes = _ATTACHED_COMMAND_PREFIXES.get(word)
-        if attached_prefixes is None:
-            return word
-        if (
-            not remainder
-            or remainder[0].isspace()
-            or remainder[0].isdigit()
-            or remainder.startswith(("แล้ว", "และ", "จากนั้น"))
-            or remainder.startswith(attached_prefixes)
-        ):
+        excluded_prefixes = _LEXICALIZED_NON_COMMAND_PREFIXES.get(word, ())
+        if not any(text.startswith(prefix) for prefix in excluded_prefixes):
             return word
     return None
 
@@ -326,9 +292,9 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
             return _unresolved("คำสั่งเพิ่มเงินออมมีข้อมูลที่ไม่รู้จัก")
         return SavingsProgressCommand(CommandKind.ADD_SAVINGS, amount)
 
-    if any(phrase in normalized for phrase in _NEGATED_TRANSACTION_PHRASES):
+    if any(re.search(pattern, normalized) for pattern in _NEGATED_TRANSACTION_PATTERNS):
         return _unresolved("ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก")
-    if any(phrase in normalized for phrase in _FUTURE_TRANSACTION_PHRASES):
+    if any(re.search(pattern, normalized) for pattern in _FUTURE_TRANSACTION_PATTERNS):
         return _unresolved("ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก")
 
     transaction_date, without_date, date_error = _extract_date(
@@ -343,11 +309,24 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
 
     expense_word = _leading_command_word(without_date.strip(), _EXPENSE_WORDS)
     income_word = _leading_command_word(without_date.strip(), _INCOME_WORDS)
+    income_action_word = _leading_command_word(
+        without_date.strip(),
+        _INCOME_ACTION_WORDS,
+    )
     expense = expense_word is not None
     income = income_word is not None
-    if expense and _contains_linked_second_command(without_date.strip(), _EXPENSE_WORDS, _INCOME_WORDS):
+    if expense and _contains_linked_second_command(
+        without_date.strip(),
+        _EXPENSE_WORDS,
+        _INCOME_ACTION_WORDS,
+    ):
         income = True
-    if income and _contains_linked_second_command(without_date.strip(), _INCOME_WORDS, _EXPENSE_WORDS):
+    if income_action_word and _contains_linked_second_command(
+        without_date.strip(),
+        _INCOME_ACTION_WORDS,
+        _EXPENSE_WORDS,
+    ):
+        income = True
         expense = True
     if expense and income:
         return _unresolved("พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน")

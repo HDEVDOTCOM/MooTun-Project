@@ -35,6 +35,14 @@ class Classification:
 
 CATEGORY_RULES: tuple[CategoryRule, ...] = (
     CategoryRule(
+        "expense.rent_context",
+        "expense",
+        "ที่พัก",
+        ("ค่าเช่า",),
+        priority=110,
+        prefix_only=True,
+    ),
+    CategoryRule(
         "income.salary",
         "income",
         "เงินเดือน",
