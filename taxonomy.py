@@ -33,15 +33,33 @@ class Classification:
     rule_id: str
 
 
-CATEGORY_RULES: tuple[CategoryRule, ...] = (
-    CategoryRule(
-        "expense.rent_context",
-        "expense",
-        "ที่พัก",
-        ("ค่าเช่า",),
-        priority=110,
-        prefix_only=True,
+SEMANTIC_ACTION_PHRASES: dict[TransactionType, tuple[str, ...]] = {
+    "expense": (
+        "รับประทาน",
+        "เติมน้ำมัน",
+        "เรียนพิเศษ",
+        "ชอปปิง",
+        "เดินทาง",
+        "ดูหนัง",
     ),
+    "income": (
+        "เงินเดือนเข้า",
+        "ผู้ปกครองให้",
+        "สอนพิเศษ",
+        "งานพิเศษ",
+        "ฟรีแลนซ์",
+        "แม่ให้",
+        "พ่อให้",
+        "ได้เงิน",
+        "ได้ค่าขนม",
+        "เงินเดือน",
+        "โบนัส",
+        "ขาย",
+    ),
+}
+
+
+CATEGORY_RULES: tuple[CategoryRule, ...] = (
     CategoryRule(
         "income.salary",
         "income",
@@ -172,6 +190,31 @@ def _contains_keyword(
     return keyword in text
 
 
+def has_supported_item_prefix(text: str) -> bool:
+    """Return whether an attached short command has a known item boundary."""
+
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if normalized.startswith(("ค่า", "เงิน")):
+        return True
+    for rule in CATEGORY_RULES:
+        for keyword in rule.keywords:
+            if keyword in rule.exact_keywords:
+                if re.match(rf"^{re.escape(keyword)}(?=\s|$)", normalized):
+                    return True
+            elif keyword.isascii() and keyword.isalnum():
+                if re.match(rf"^{re.escape(keyword)}(?![a-z0-9])", normalized):
+                    return True
+            elif normalized.startswith(keyword):
+                return True
+    return False
+
+
+def _is_leading_expense_context(text: str, keyword: str) -> bool:
+    return text.startswith(keyword) or bool(
+        re.match(rf"^ค่า\s*{re.escape(keyword)}", text)
+    )
+
+
 def classify_item(
     text: str,
     *,
@@ -203,13 +246,24 @@ def classify_item(
             )
         ]
         if matched:
-            candidates.append((rule.priority, max(map(len, matched)), rule))
+            priority = rule.priority
+            if rule.transaction_type == "expense" and any(
+                _is_leading_expense_context(normalized, word) for word in matched
+            ):
+                priority = max(priority, 95)
+            candidates.append((priority, max(map(len, matched)), rule))
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     best_priority, best_length, best_rule = candidates[0]
+    if (
+        explicit_type is None
+        and normalized.startswith("ค่า")
+        and best_rule.transaction_type == "income"
+    ):
+        return None
     tied_categories = {
         rule.category
         for priority, length, rule in candidates
@@ -233,7 +287,9 @@ __all__ = [
     "CATEGORY_RULES",
     "CategoryRule",
     "Classification",
+    "SEMANTIC_ACTION_PHRASES",
     "TransactionType",
     "classify_item",
     "fallback_category",
+    "has_supported_item_prefix",
 ]

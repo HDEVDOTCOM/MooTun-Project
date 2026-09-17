@@ -37,12 +37,14 @@ def test_monthly_summary_and_delete_follow_chat_commands(db_session):
     handle_text_message("U-test", "จ่าย 120.50 อาหาร", moment, db_session)
 
     summary_reply = handle_text_message("U-test", "สรุปเดือนนี้", moment, db_session)
+    assert "เดือน 9/2569" in summary_reply
     assert "รายรับ: 1,000 บาท" in summary_reply
     assert "รายจ่าย: 120.5 บาท" in summary_reply
     assert "คงเหลือ: 879.5 บาท" in summary_reply
 
     delete_reply = handle_text_message("U-test", "ลบล่าสุด", moment, db_session)
     assert "ลบรายการล่าสุดแล้ว" in delete_reply
+    assert "14/09/2569" in delete_reply
     summary = monthly_summary("U-test", 2026, 9, session=db_session)
     assert summary["expense"] == 0
 

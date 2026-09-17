@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 from database import init_db, session_scope
 from line_api import LineAPIError, reply_text, verify_webhook_signature
 from messages import (
+    format_buddhist_date,
+    format_buddhist_month,
     format_help_message,
     format_monthly_summary,
     format_recent_transactions,
@@ -106,7 +108,7 @@ def _event_datetime(timestamp_ms: object) -> datetime:
 
 def _thai_month_label(moment: datetime) -> str:
     local = moment.astimezone(BANGKOK)
-    return f"เดือน {local.month}/{local.year + 543}"
+    return format_buddhist_month(local)
 
 
 def handle_text_message(
@@ -172,7 +174,8 @@ def handle_text_message(
             return "ยังไม่มีรายการให้ลบ"
         return (
             "🗑️ ลบรายการล่าสุดแล้ว\n"
-            f"{item.category} · {item.amount:,.2f} บาท · {item.occurred_on:%d/%m/%Y}"
+            f"{item.category} · {item.amount:,.2f} บาท · "
+            f"{format_buddhist_date(item.occurred_on)}"
         ).replace(".00 บาท", " บาท")
 
     if command.kind == CommandKind.MONTHLY_SUMMARY:

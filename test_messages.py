@@ -32,7 +32,7 @@ def test_confirmation_contains_clean_transaction_fields() -> None:
     assert "บันทึกรายจ่ายแล้ว" in message
     assert "จำนวน: 80 บาท" in message
     assert "หมวด: อาหาร" in message
-    assert "วันที่: 14/09/2026" in message
+    assert "วันที่: 14/09/2569" in message
     assert "ข้าวกลางวัน โรงอาหาร" in message
 
 
@@ -41,12 +41,24 @@ def test_recent_transactions_handles_empty_and_mixed_items() -> None:
 
     message = format_recent_transactions(
         [
-            {"type": "income", "amount": 500, "category": "ค่าขนม"},
-            {"type": "expense", "amount": 42.5, "category": "เดินทาง"},
+            {
+                "type": "income",
+                "amount": 500,
+                "category": "ค่าขนม",
+                "date": date(2026, 9, 14),
+            },
+            {
+                "type": "expense",
+                "amount": 42.5,
+                "category": "เดินทาง",
+                "date": date(2026, 9, 13),
+            },
         ]
     )
     assert "+500 บาท" in message
     assert "−42.5 บาท" in message
+    assert "14/09/2569" in message
+    assert "13/09/2569" in message
 
 
 def test_monthly_summary_calculates_balance_and_optional_categories() -> None:

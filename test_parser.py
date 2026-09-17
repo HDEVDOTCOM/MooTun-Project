@@ -84,6 +84,25 @@ class TransactionParsingTests(unittest.TestCase):
                 )
                 self.assertEqual(command.inference_rule, f"explicit.{rule_word}")
 
+    def test_amount_first_explicit_aliases_do_not_reverse_direction(self) -> None:
+        examples = (
+            ("50 รับข้าว", CommandKind.INCOME, "50", "รายรับอื่นๆ", "ข้าว"),
+            ("50 รับ ข้าว", CommandKind.INCOME, "50", "รายรับอื่นๆ", "ข้าว"),
+            ("50 บาท รับข้าว", CommandKind.INCOME, "50", "รายรับอื่นๆ", "ข้าว"),
+            ("500 เสียโบนัส", CommandKind.EXPENSE, "500", "อื่นๆ", "โบนัส"),
+            ("500 เสีย โบนัส", CommandKind.EXPENSE, "500", "อื่นๆ", "โบนัส"),
+            ("500 บาท เสียโบนัส", CommandKind.EXPENSE, "500", "อื่นๆ", "โบนัส"),
+        )
+        for text, kind, amount, category, description in examples:
+            with self.subTest(text=text):
+                self.assert_transaction(
+                    text,
+                    kind=kind,
+                    amount=amount,
+                    category=category,
+                    description=description,
+                )
+
     def test_expense_word_and_amount_order_variants(self) -> None:
         for text in ("จ่ายข้าว 50", "จ่าย 50 ข้าว", "ซื้อข้าว 50", "500 อาหาร"):
             with self.subTest(text=text):
@@ -170,6 +189,19 @@ class TransactionParsingTests(unittest.TestCase):
         self.assertIsInstance(unresolved, UnresolvedCommand)
         self.assertEqual(unresolved.reason, "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
 
+        for text in (
+            "รับทราบ 50",
+            "รับบท 50",
+            "รับประกัน 500",
+            "เสียหลัก 50",
+            "รับชาติ 500",
+            "รับชาวบ้าน 500",
+            "เสียชาตินี้ 500",
+        ):
+            with self.subTest(text=text):
+                unresolved = parse_command(text, now=TODAY)
+                self.assertIsInstance(unresolved, UnresolvedCommand)
+
     def test_linked_text_does_not_treat_embedded_prefix_as_income(self) -> None:
         self.assert_transaction(
             "จ่ายแล้วรับประทานข้าว 50",
@@ -180,14 +212,23 @@ class TransactionParsingTests(unittest.TestCase):
         )
 
     def test_semantic_matches_respect_phrase_boundaries(self) -> None:
-        for text in ("ค่าเช่าร้านขายของ 5000", "ค่าเช่าห้องสอนพิเศษ 5000"):
+        expense_contexts = (
+            ("ค่าเช่าร้านขายของ 5000", "5000", "ที่พัก"),
+            ("ค่าเช่าห้องสอนพิเศษ 5000", "5000", "ที่พัก"),
+            ("ค่าไฟห้องสอนพิเศษ 500", "500", "บิลและบริการ"),
+            ("ค่าเน็ตสอนพิเศษ 599", "599", "บิลและบริการ"),
+            ("ค่าหอสอนพิเศษ 5000", "5000", "ที่พัก"),
+            ("ค่าเดินทางไปสอนพิเศษ 50", "50", "เดินทาง"),
+            ("หนังสือสอนพิเศษ 500", "500", "การศึกษา"),
+        )
+        for text, amount, category in expense_contexts:
             with self.subTest(text=text):
                 self.assert_transaction(
                     text,
                     kind=CommandKind.EXPENSE,
-                    amount="5000",
-                    category="ที่พัก",
-                    description=text.removesuffix(" 5000"),
+                    amount=amount,
+                    category=category,
+                    description=text.removesuffix(f" {amount}"),
                 )
         self.assert_transaction(
             "สอนพิเศษ 500",
@@ -196,6 +237,8 @@ class TransactionParsingTests(unittest.TestCase):
             category="งานพิเศษ",
             description="สอนพิเศษ",
         )
+        unresolved = parse_command("ค่าสอนพิเศษ 500", now=TODAY)
+        self.assertIsInstance(unresolved, UnresolvedCommand)
         unresolved = parse_command("วิชา 50", now=TODAY)
         self.assertIsInstance(unresolved, UnresolvedCommand)
         self.assertEqual(unresolved.reason, "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
@@ -357,11 +400,29 @@ class ConservativeParsingTests(unittest.TestCase):
         self.assertEqual(command.reason, "พบจำนวนเงินมากกว่าหนึ่งค่า")
 
     def test_rejects_both_transaction_types(self) -> None:
-        self.assert_unresolved("รับแล้วจ่าย 500", CommandKind.AMBIGUOUS)
-        self.assert_unresolved("จ่าย แล้วรับ 500", CommandKind.AMBIGUOUS)
-        self.assert_unresolved("จ่ายค่าข้าวแล้วรับเงินคืน 500", CommandKind.AMBIGUOUS)
-        self.assert_unresolved("ซื้อข้าวแล้วขาย 50", CommandKind.AMBIGUOUS)
-        self.assert_unresolved("ขายข้าวแล้วจ่าย 50", CommandKind.AMBIGUOUS)
+        examples = (
+            "รับแล้วจ่าย 500",
+            "จ่าย แล้วรับ 500",
+            "จ่ายค่าข้าวแล้วรับเงินคืน 500",
+            "ซื้อข้าวแล้วขาย 50",
+            "ขายข้าวแล้วจ่าย 50",
+            "จ่ายข้าวแล้วได้เงิน 50",
+            "ได้เงินแล้วจ่ายข้าว 50",
+            "แม่ให้แล้วจ่าย 500",
+            "เงินเดือนเข้าแล้วซื้อข้าว 50",
+            "ซื้อข้าวแล้วไปขาย 50",
+            "ขายข้าวแล้วไปซื้อ 50",
+            "จ่ายข้าวแล้วก็ได้เงินคืน 50",
+            "จ่ายข้าวแล้วได้ค่าขนม 50",
+            "จ่ายข้าวแล้วเงินเดือน 50",
+            "จ่ายข้าวแล้วโบนัส 500",
+            "เติมน้ำมันแล้วได้เงิน 1000",
+            "ดูหนังแล้วได้เงิน 300",
+            "เรียนพิเศษแล้วได้เงิน 500",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assert_unresolved(text, CommandKind.AMBIGUOUS)
 
     def test_unknown_text(self) -> None:
         self.assert_unresolved("สวัสดี", CommandKind.UNKNOWN)
@@ -376,13 +437,34 @@ class ConservativeParsingTests(unittest.TestCase):
             "ไม่ได้รับเงินเดือน 20000",
             "ไม่ขายข้าว 50",
             "ไม่ได้ขายข้าว 50",
+            "ไม่ ได้ขายข้าว 50",
             "ไม่เคยซื้อข้าว 50",
+            "ไม่ ได้ ซื้อข้าว 50",
+            "ไม่ได้เสียโบนัส 500",
+            "ไม่ได้สอนพิเศษ 500",
             "จะขายข้าว 50",
             "จะ ซื้อข้าว 50",
+            "จะเสียโบนัส 500",
+            "จะสอนพิเศษ 500",
+            "จะไปซื้อข้าว 50",
             "วางแผนขายข้าว 50",
             "เดือนหน้าซื้อข้าว 50",
             "พรุ่งนี้จะซื้อข้าว 50",
             "เงินเดือนยังไม่เข้า 20000",
+            "เงินเดือนจะเข้า 20000",
+            "เงินเดือนไม่เข้า 20000",
+            "เงินเดือนกำลังจะเข้า 20000",
+            "รายรับยังไม่เข้า 500",
+            "ขายไม่ได้ 500",
+            "ขายไม่ออก 500",
+            "สอนพิเศษไม่ได้ 500",
+            "เงินเดือนยังไม่ออก 20000",
+            "เงินเดือนจะออก 20000",
+            "จะเติมน้ำมัน 1000",
+            "ไม่ได้เติมน้ำมัน 1000",
+            "เติมน้ำมันไม่ได้ 1000",
+            "จะดูหนัง 300",
+            "จะเรียนพิเศษ 500",
         )
         for text in examples:
             with self.subTest(text=text):

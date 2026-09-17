@@ -206,3 +206,22 @@ def test_ambiguous_natural_language_does_not_write_transaction(webhook_client):
     with Session(engine) as session:
         assert session.scalar(select(func.count(Transaction.id))) == 0
     assert "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย" in replies[0][1]
+
+
+def test_unsafe_rule_interactions_do_not_write_transactions(webhook_client):
+    client, engine, replies = webhook_client
+    payload = {
+        "events": [
+            _text_event("evt-negated", "U-alice", "ไม่ได้สอนพิเศษ 500"),
+            _text_event("evt-conflict", "U-alice", "จ่ายข้าวแล้วได้เงิน 50"),
+            _text_event("evt-prefix", "U-alice", "รับทราบ 50"),
+        ]
+    }
+    body, headers = _signed_body(payload)
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 3
+    assert len(replies) == 3

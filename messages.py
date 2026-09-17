@@ -53,6 +53,18 @@ def format_amount(value: object) -> str:
     return rendered
 
 
+def buddhist_year(year: int) -> int:
+    return year + 543
+
+
+def format_buddhist_date(value: date | datetime) -> str:
+    return f"{value.day:02d}/{value.month:02d}/{buddhist_year(value.year)}"
+
+
+def format_buddhist_month(value: date | datetime) -> str:
+    return f"เดือน {value.month}/{buddhist_year(value.year)}"
+
+
 def format_transaction_confirmation(transaction: Mapping[str, object]) -> str:
     """Confirm one saved income or expense transaction in Thai."""
 
@@ -234,7 +246,7 @@ def _clean(value: object, fallback: str) -> str:
 
 def _format_date(value: object) -> str:
     if isinstance(value, datetime):
-        return value.strftime("%d/%m/%Y")
+        return format_buddhist_date(value)
     if isinstance(value, date):
-        return value.strftime("%d/%m/%Y")
+        return format_buddhist_date(value)
     return _clean(value, "")
