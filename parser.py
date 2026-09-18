@@ -116,8 +116,10 @@ _FUTURE_TRANSACTION_PATTERNS = (
     r"(?:เงินเดือน|โบนัส|รายรับ)(?:กำลัง)?จะ(?:เข้า|ได้|ออก)",
     r"(?:พรุ่งนี้|มะรืน|สัปดาห์หน้า|เดือนหน้า|ปีหน้า)",
 )
+_TRAILING_INTENT_NOISE_PATTERN = r"(?:(?:ครับ|ค่ะ|คะ|นะ|จ้า|จ้ะ|จ๊ะ|เลย|ด้วย)|[.,;:!?…ฯๆ])"
 _TERMINAL_NEGATED_ACTION_PATTERN = (
-    rf"{_TRANSACTION_SIGNAL_PATTERN}.+(?:ยัง)?(?:ไม่ได้|ไม่ออก)$"
+    rf"{_TRANSACTION_SIGNAL_PATTERN}.+(?:ยัง)?(?:ไม่ได้|ไม่ออก)"
+    rf"(?:{_TRAILING_INTENT_NOISE_PATTERN})*$"
 )
 
 
@@ -139,13 +141,22 @@ def _amount(raw: str) -> Decimal | None:
     return value if value > 0 else None
 
 
-def _extract_amount(text: str) -> tuple[Decimal | None, str, int]:
+def _extract_amount(
+    text: str,
+    *,
+    consume_currency_unit: bool = False,
+) -> tuple[Decimal | None, str, int]:
     matches = list(re.finditer(_AMOUNT_PATTERN, text))
     if len(matches) != 1:
         return None, text, len(matches)
     match = matches[0]
     value = _amount(match.group())
-    cleaned = f"{text[:match.start()]} {text[match.end():]}"
+    end = match.end()
+    if consume_currency_unit:
+        currency_unit = re.match(r"\s*บาท", text[end:])
+        if currency_unit:
+            end += currency_unit.end()
+    cleaned = f"{text[:match.start()]} {text[end:]}"
     return value, cleaned, 1
 
 
@@ -377,15 +388,20 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
         return _unresolved(invalid_reason)
 
     amount, without_amount, count = _extract_amount(without_date)
+    _, intent_without_amount, _ = _extract_amount(
+        without_date,
+        consume_currency_unit=True,
+    )
     _, display_without_amount, _ = _extract_amount(display_without_date)
     if count > 1:
         return _unresolved("พบจำนวนเงินมากกว่าหนึ่งค่า")
     if count == 1 and amount is None:
         return _unresolved("จำนวนเงินต้องมากกว่า 0")
-    intent_analysis = re.sub(r"(?<!\S)บาท(?=\s|$)", " ", without_amount)
-    if intent_rejection := _transaction_intent_rejection(intent_analysis):
+    if intent_rejection := _transaction_intent_rejection(intent_without_amount):
         return _unresolved(intent_rejection)
-    command_text = without_amount.strip() if count == 1 else without_date.strip()
+    command_text = (
+        intent_without_amount.strip() if count == 1 else without_date.strip()
+    )
     command_text = re.sub(r"^บาท\s*", "", command_text)
     expense_word = _leading_command_word(command_text, _EXPENSE_WORDS)
     income_word = _leading_command_word(command_text, _INCOME_WORDS)

@@ -367,6 +367,13 @@ class TransactionParsingTests(unittest.TestCase):
             category="บิลและบริการ",
             description="ค่าเน็ตไม่รวมภาษี",
         )
+        self.assert_transaction(
+            "จ่าย 50 บาท ร้านร้อยบาท",
+            kind=CommandKind.EXPENSE,
+            amount="50",
+            category="อื่นๆ",
+            description="ร้านร้อยบาท",
+        )
 
     def test_same_direction_linked_clause_after_currency_remains_valid(self) -> None:
         command = parse_command("จ่ายข้าวแล้ว 50 บาท ซื้อหนังสือ", now=TODAY)
@@ -504,6 +511,22 @@ class ConservativeParsingTests(unittest.TestCase):
                     "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
                 )
 
+    def test_attached_currency_before_linked_action_does_not_hide_conflict(self) -> None:
+        examples = (
+            "จ่ายข้าวแล้ว 50 บาทได้เงิน",
+            "ได้เงินแล้ว 50 บาทจ่ายข้าว",
+            "จ่ายข้าวแล้ว50บาทได้เงิน",
+            "จ่ายข้าวและ50บาทได้รับโบนัส",
+            "ได้เงินจากนั้น๕๐บาทจ่ายข้าว",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
+                )
+
     def test_unknown_text(self) -> None:
         self.assert_unresolved("สวัสดี", CommandKind.UNKNOWN)
 
@@ -567,12 +590,56 @@ class ConservativeParsingTests(unittest.TestCase):
                     "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
                 )
 
+    def test_terminal_negation_allows_bounded_trailing_material(self) -> None:
+        examples = (
+            "ขายข้าวไม่ได้ครับ 50",
+            "ขายข้าวไม่ออกเลย 50",
+            "จ่ายค่าเน็ตไม่ได้ค่ะ 599",
+            "ขายข้าวไม่ได้! 50",
+            "ซื้อหนังสือไม่ได้ครับ! 80",
+            "ขายของไม่ออกนะ... 100",
+            "จ่ายค่าหอไม่ได้จ้า 5000",
+            "ซื้อข้าวไม่ได้คะ? 50",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
     def test_interrupted_future_transactions_are_not_recorded(self) -> None:
         examples = (
             "เงินเดือน 20000 จะเข้า",
             "เงินเดือน 2026-09-15 จะเข้า 20000",
         )
         for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
+                )
+
+    def test_attached_currency_does_not_hide_transaction_intent(self) -> None:
+        negated = (
+            "เงินเดือน 20000 บาทยังไม่เข้า",
+            "เงินเดือน ๒๐๐๐๐บาทยังไม่เข้า",
+        )
+        for text in negated:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
+        future = (
+            "เงินเดือน 20000 บาทจะเข้า",
+            "โบนัสวันนี้ 500บาทจะเข้า",
+        )
+        for text in future:
             with self.subTest(text=text):
                 command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
                 self.assertEqual(
