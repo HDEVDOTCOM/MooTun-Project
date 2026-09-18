@@ -87,7 +87,7 @@ ParsedCommand: TypeAlias = (
 _AMOUNT_PATTERN = r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d.])"
 _EXPENSE_WORDS = ("รายจ่าย", "จ่าย", "ซื้อ", "เสีย")
 _INCOME_WORDS = ("รายรับ", "ได้รับ", "เงินเข้า", "รับ")
-_AMBIGUOUS_SHORT_COMMANDS = {"รับ", "เสีย"}
+_BOUNDARY_SENSITIVE_COMMANDS = {"รับ", "เสีย", "ได้รับ"}
 _LINK_WORDS = ("แล้ว", "และ", "จากนั้น")
 _GUARD_SIGNALS = tuple(
     sorted(
@@ -115,6 +115,9 @@ _FUTURE_TRANSACTION_PATTERNS = (
     rf"(?:กำลังจะ|วางแผน|จะ)(?:ไป)?{_TRANSACTION_SIGNAL_PATTERN}",
     r"(?:เงินเดือน|โบนัส|รายรับ)(?:กำลัง)?จะ(?:เข้า|ได้|ออก)",
     r"(?:พรุ่งนี้|มะรืน|สัปดาห์หน้า|เดือนหน้า|ปีหน้า)",
+)
+_TERMINAL_NEGATED_ACTION_PATTERN = (
+    rf"{_TRANSACTION_SIGNAL_PATTERN}.+(?:ยัง)?(?:ไม่ได้|ไม่ออก)$"
 )
 
 
@@ -212,6 +215,20 @@ def _display_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
+def _transaction_intent_rejection(text: str) -> str | None:
+    intent_text = re.sub(r"\s+", "", text)
+    if any(re.search(pattern, intent_text) for pattern in _NEGATED_TRANSACTION_PATTERNS):
+        return "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก"
+
+    clauses = re.split("|".join(map(re.escape, _LINK_WORDS)), intent_text)
+    if any(re.search(_TERMINAL_NEGATED_ACTION_PATTERN, clause) for clause in clauses):
+        return "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก"
+
+    if any(re.search(pattern, intent_text) for pattern in _FUTURE_TRANSACTION_PATTERNS):
+        return "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก"
+    return None
+
+
 def _leading_command_word(text: str, words: tuple[str, ...]) -> str | None:
     """Return a leading verb only at a supported command/item boundary."""
 
@@ -219,7 +236,7 @@ def _leading_command_word(text: str, words: tuple[str, ...]) -> str | None:
         if not text.startswith(word):
             continue
         remainder = text[len(word) :]
-        if word not in _AMBIGUOUS_SHORT_COMMANDS:
+        if word not in _BOUNDARY_SENSITIVE_COMMANDS:
             return word
         if (
             not remainder
@@ -232,7 +249,11 @@ def _leading_command_word(text: str, words: tuple[str, ...]) -> str | None:
 
 
 def _leading_action_direction(text: str) -> TransactionType | None:
-    normalized = re.sub(r"^(?:(?:ก็|ไป)\s*)+", "", text.strip())
+    normalized = re.sub(
+        r"^(?:(?:ก็|ไป)\s*|บาท(?:\s+|$))+",
+        "",
+        text.strip(),
+    )
     if _leading_command_word(normalized, _EXPENSE_WORDS):
         return "expense"
     if _leading_command_word(normalized, _INCOME_WORDS):
@@ -255,11 +276,11 @@ def _has_linked_direction_conflict(text: str) -> bool:
     return len(directions) > 1
 
 
-def _has_unsupported_short_command_prefix(text: str) -> bool:
+def _has_unsupported_boundary_sensitive_command_prefix(text: str) -> bool:
     normalized = text.strip()
-    if not any(normalized.startswith(word) for word in _AMBIGUOUS_SHORT_COMMANDS):
+    if not any(normalized.startswith(word) for word in _BOUNDARY_SENSITIVE_COMMANDS):
         return False
-    if _leading_command_word(normalized, tuple(_AMBIGUOUS_SHORT_COMMANDS)):
+    if _leading_command_word(normalized, tuple(_BOUNDARY_SENSITIVE_COMMANDS)):
         return False
     return not any(
         normalized.startswith(phrase)
@@ -339,11 +360,8 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
             return _unresolved("คำสั่งเพิ่มเงินออมมีข้อมูลที่ไม่รู้จัก")
         return SavingsProgressCommand(CommandKind.ADD_SAVINGS, amount)
 
-    intent_text = re.sub(r"\s+", "", normalized)
-    if any(re.search(pattern, intent_text) for pattern in _NEGATED_TRANSACTION_PATTERNS):
-        return _unresolved("ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก")
-    if any(re.search(pattern, intent_text) for pattern in _FUTURE_TRANSACTION_PATTERNS):
-        return _unresolved("ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก")
+    if intent_rejection := _transaction_intent_rejection(normalized):
+        return _unresolved(intent_rejection)
 
     transaction_date, without_date, date_error = _extract_date(
         normalized, _local_date(now)
@@ -364,6 +382,9 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
         return _unresolved("พบจำนวนเงินมากกว่าหนึ่งค่า")
     if count == 1 and amount is None:
         return _unresolved("จำนวนเงินต้องมากกว่า 0")
+    intent_analysis = re.sub(r"(?<!\S)บาท(?=\s|$)", " ", without_amount)
+    if intent_rejection := _transaction_intent_rejection(intent_analysis):
+        return _unresolved(intent_rejection)
     command_text = without_amount.strip() if count == 1 else without_date.strip()
     command_text = re.sub(r"^บาท\s*", "", command_text)
     expense_word = _leading_command_word(command_text, _EXPENSE_WORDS)
@@ -372,7 +393,7 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
     income = income_word is not None
     if _has_linked_direction_conflict(command_text):
         return _unresolved("พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน")
-    if _has_unsupported_short_command_prefix(command_text):
+    if _has_unsupported_boundary_sensitive_command_prefix(command_text):
         return _unresolved("กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
     if count == 0:
         item_without_command = _strip_transaction_words(

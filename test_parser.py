@@ -84,6 +84,43 @@ class TransactionParsingTests(unittest.TestCase):
                 )
                 self.assertEqual(command.inference_rule, f"explicit.{rule_word}")
 
+    def test_received_alias_requires_a_supported_boundary(self) -> None:
+        for text in ("ได้รับบท 50", "ได้รับประทานข้าว 50"):
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, UnresolvedCommand)
+                self.assertEqual(
+                    command.reason,
+                    "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย",
+                )
+
+        for text in ("ได้รับโบนัส 500", "ได้รับ 500 โบนัส"):
+            with self.subTest(text=text):
+                command = self.assert_transaction(
+                    text,
+                    kind=CommandKind.INCOME,
+                    amount="500",
+                    category="เงินได้รับ",
+                    description="โบนัส",
+                )
+                self.assertEqual(command.inference_rule, "explicit.ได้รับ")
+
+    def test_clear_explicit_aliases_accept_unknown_attached_items(self) -> None:
+        examples = (
+            ("ซื้อโทรศัพท์ 30000", CommandKind.EXPENSE, "30000", "อื่นๆ", "โทรศัพท์"),
+            ("รายจ่ายซ่อมรถ 500", CommandKind.EXPENSE, "500", "อื่นๆ", "ซ่อมรถ"),
+            ("เงินเข้าบัญชี 500", CommandKind.INCOME, "500", "รายรับอื่นๆ", "บัญชี"),
+        )
+        for text, kind, amount, category, description in examples:
+            with self.subTest(text=text):
+                self.assert_transaction(
+                    text,
+                    kind=kind,
+                    amount=amount,
+                    category=category,
+                    description=description,
+                )
+
     def test_amount_first_explicit_aliases_do_not_reverse_direction(self) -> None:
         examples = (
             ("50 รับข้าว", CommandKind.INCOME, "50", "รายรับอื่นๆ", "ข้าว"),
@@ -306,6 +343,35 @@ class TransactionParsingTests(unittest.TestCase):
             description="ไม่ระบุรายการ",
             transaction_date=date(2026, 9, 15),
         )
+        self.assert_transaction(
+            "เงินเดือน 2026-09-15 20000",
+            kind=CommandKind.INCOME,
+            amount="20000",
+            category="เงินเดือน",
+            description="เงินเดือน",
+            transaction_date=date(2026, 9, 15),
+        )
+
+    def test_descriptive_not_phrases_remain_transactions(self) -> None:
+        self.assert_transaction(
+            "ซื้อข้าวไม่เผ็ด 50",
+            kind=CommandKind.EXPENSE,
+            amount="50",
+            category="อาหาร",
+            description="ข้าวไม่เผ็ด",
+        )
+        self.assert_transaction(
+            "จ่ายค่าเน็ตไม่รวมภาษี 599",
+            kind=CommandKind.EXPENSE,
+            amount="599",
+            category="บิลและบริการ",
+            description="ค่าเน็ตไม่รวมภาษี",
+        )
+
+    def test_same_direction_linked_clause_after_currency_remains_valid(self) -> None:
+        command = parse_command("จ่ายข้าวแล้ว 50 บาท ซื้อหนังสือ", now=TODAY)
+        self.assertIsInstance(command, TransactionCommand)
+        self.assertEqual(command.kind, CommandKind.EXPENSE)
 
     def test_thai_buddhist_date(self) -> None:
         command = parse_command("ข้าว 80 13/09/2569", now=TODAY)
@@ -424,6 +490,20 @@ class ConservativeParsingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assert_unresolved(text, CommandKind.AMBIGUOUS)
 
+    def test_currency_before_linked_action_does_not_hide_conflict(self) -> None:
+        examples = (
+            "จ่ายข้าวแล้ว 50 บาท ได้เงิน",
+            "ได้เงินแล้ว 50 บาท จ่ายข้าว",
+            "จ่ายข้าวแล้ว ๕๐ บาท รับเงิน",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
+                )
+
     def test_unknown_text(self) -> None:
         self.assert_unresolved("สวัสดี", CommandKind.UNKNOWN)
 
@@ -469,6 +549,36 @@ class ConservativeParsingTests(unittest.TestCase):
         for text in examples:
             with self.subTest(text=text):
                 self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+
+    def test_interrupted_negated_transactions_are_not_recorded(self) -> None:
+        examples = (
+            "ขายข้าวไม่ได้ 50",
+            "ขายข้าวไม่ออก 50",
+            "จ่ายค่าเน็ตไม่ได้ 599",
+            "ซื้อข้าวไม่ได้ 50",
+            "เงินเดือน 20000 ยังไม่เข้า",
+            "เงินเดือนวันนี้ยังไม่เข้า 20000",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
+    def test_interrupted_future_transactions_are_not_recorded(self) -> None:
+        examples = (
+            "เงินเดือน 20000 จะเข้า",
+            "เงินเดือน 2026-09-15 จะเข้า 20000",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
+                )
 
     def test_unknown_transfer_direction_is_not_guessed(self) -> None:
         command = self.assert_unresolved("โอน 500", CommandKind.AMBIGUOUS)
