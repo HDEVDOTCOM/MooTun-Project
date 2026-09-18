@@ -215,8 +215,10 @@ def test_unsafe_rule_interactions_do_not_write_transactions(webhook_client):
             _text_event("evt-negated", "U-alice", "ไม่ได้สอนพิเศษ 500"),
             _text_event("evt-interrupted-negation", "U-alice", "ขายข้าวไม่ได้ 50"),
             _text_event("evt-suffixed-negation", "U-alice", "ขายข้าวไม่ได้ครับ 50"),
+            _text_event("evt-unknown-negation-suffix", "U-alice", "ขายข้าวไม่ได้หรอก 50"),
             _text_event("evt-conflict", "U-alice", "จ่ายข้าวแล้วได้เงิน 50"),
             _text_event("evt-attached-baht", "U-alice", "จ่ายข้าวแล้ว 50 บาทได้เงิน"),
+            _text_event("evt-punctuated-amount", "U-alice", "จ่ายข้าวแล้ว (50 บาท) ได้เงิน"),
             _text_event("evt-prefix", "U-alice", "รับทราบ 50"),
         ]
     }
@@ -226,5 +228,5 @@ def test_unsafe_rule_interactions_do_not_write_transactions(webhook_client):
 
     with Session(engine) as session:
         assert session.scalar(select(func.count(Transaction.id))) == 0
-        assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 6
-    assert len(replies) == 6
+        assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 8
+    assert len(replies) == 8

@@ -527,6 +527,23 @@ class ConservativeParsingTests(unittest.TestCase):
                     "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
                 )
 
+    def test_punctuation_around_amount_does_not_hide_linked_conflict(self) -> None:
+        examples = (
+            "จ่ายข้าวแล้ว (50 บาท) ได้เงิน",
+            "จ่ายข้าวแล้ว (50) บาท ได้เงิน",
+            "จ่ายข้าวแล้ว50บาท,ได้เงิน",
+            "ได้เงินแล้ว50บาท;จ่ายข้าว",
+            "ได้เงินแล้ว [๕๐ บาท] จ่ายข้าว",
+            "จ่ายข้าวแล้ว（50 บาท）ได้เงิน",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
+                )
+
     def test_unknown_text(self) -> None:
         self.assert_unresolved("สวัสดี", CommandKind.UNKNOWN)
 
@@ -609,6 +626,25 @@ class ConservativeParsingTests(unittest.TestCase):
                     "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
                 )
 
+    def test_strong_negation_fails_closed_with_unknown_trailing_text(self) -> None:
+        examples = (
+            "ขายข้าวไม่ได้หรอก 50",
+            "จ่ายค่าเน็ตไม่ได้หรอกค่ะ 599",
+            "ขายข้าวไม่ออกเลยจริงๆ 50",
+            "ซื้อหนังสือไม่ได้มั้ง 80",
+            "จ่ายค่าหอไม่ได้อะนะ 5000",
+            "ขายของไม่ออกจริงๆนะ 100",
+            "ขายข้าวไม่ได้...หรอกนะ! 50",
+            "จ่ายค่าไฟไม่ได้(หรอก) 500",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
     def test_interrupted_future_transactions_are_not_recorded(self) -> None:
         examples = (
             "เงินเดือน 20000 จะเข้า",
@@ -638,6 +674,33 @@ class ConservativeParsingTests(unittest.TestCase):
         future = (
             "เงินเดือน 20000 บาทจะเข้า",
             "โบนัสวันนี้ 500บาทจะเข้า",
+        )
+        for text in future:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
+                )
+
+    def test_punctuation_around_amount_does_not_hide_transaction_intent(self) -> None:
+        negated = (
+            "ขายข้าวไม่ได้ครับ (50 บาท)",
+            "เงินเดือน[๒๐๐๐๐บาท]ยังไม่เข้า",
+        )
+        for text in negated:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
+        future = (
+            "เงินเดือน (20000 บาท) จะเข้า",
+            "เงินเดือน (20000) บาท จะเข้า",
+            "เงินเดือน【20000】บาทจะเข้า",
+            "โบนัส（500 บาท）จะเข้า",
         )
         for text in future:
             with self.subTest(text=text):

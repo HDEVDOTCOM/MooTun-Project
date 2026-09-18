@@ -8,6 +8,7 @@ messages unresolved when their type or amount is still ambiguous.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -116,10 +117,8 @@ _FUTURE_TRANSACTION_PATTERNS = (
     r"(?:เงินเดือน|โบนัส|รายรับ)(?:กำลัง)?จะ(?:เข้า|ได้|ออก)",
     r"(?:พรุ่งนี้|มะรืน|สัปดาห์หน้า|เดือนหน้า|ปีหน้า)",
 )
-_TRAILING_INTENT_NOISE_PATTERN = r"(?:(?:ครับ|ค่ะ|คะ|นะ|จ้า|จ้ะ|จ๊ะ|เลย|ด้วย)|[.,;:!?…ฯๆ])"
-_TERMINAL_NEGATED_ACTION_PATTERN = (
+_CLAUSE_NEGATED_ACTION_PATTERN = (
     rf"{_TRANSACTION_SIGNAL_PATTERN}.+(?:ยัง)?(?:ไม่ได้|ไม่ออก)"
-    rf"(?:{_TRAILING_INTENT_NOISE_PATTERN})*$"
 )
 
 
@@ -144,20 +143,32 @@ def _amount(raw: str) -> Decimal | None:
 def _extract_amount(
     text: str,
     *,
-    consume_currency_unit: bool = False,
+    for_analysis: bool = False,
 ) -> tuple[Decimal | None, str, int]:
     matches = list(re.finditer(_AMOUNT_PATTERN, text))
     if len(matches) != 1:
         return None, text, len(matches)
     match = matches[0]
     value = _amount(match.group())
+    start = match.start()
     end = match.end()
-    if consume_currency_unit:
-        currency_unit = re.match(r"\s*บาท", text[end:])
-        if currency_unit:
-            end += currency_unit.end()
-    cleaned = f"{text[:match.start()]} {text[end:]}"
+    if for_analysis:
+        while start > 0 and _is_analysis_separator(text[start - 1]):
+            start -= 1
+        while end < len(text) and _is_analysis_separator(text[end]):
+            end += 1
+        if text.startswith("บาท", end):
+            end += len("บาท")
+            while end < len(text) and _is_analysis_separator(text[end]):
+                end += 1
+    cleaned = f"{text[:start]} {text[end:]}"
+    if for_analysis:
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return value, cleaned, 1
+
+
+def _is_analysis_separator(character: str) -> bool:
+    return character.isspace() or unicodedata.category(character).startswith("P")
 
 
 def _invalid_amount_reason(text: str) -> str | None:
@@ -232,7 +243,7 @@ def _transaction_intent_rejection(text: str) -> str | None:
         return "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก"
 
     clauses = re.split("|".join(map(re.escape, _LINK_WORDS)), intent_text)
-    if any(re.search(_TERMINAL_NEGATED_ACTION_PATTERN, clause) for clause in clauses):
+    if any(re.search(_CLAUSE_NEGATED_ACTION_PATTERN, clause) for clause in clauses):
         return "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก"
 
     if any(re.search(pattern, intent_text) for pattern in _FUTURE_TRANSACTION_PATTERNS):
@@ -390,7 +401,7 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
     amount, without_amount, count = _extract_amount(without_date)
     _, intent_without_amount, _ = _extract_amount(
         without_date,
-        consume_currency_unit=True,
+        for_analysis=True,
     )
     _, display_without_amount, _ = _extract_amount(display_without_date)
     if count > 1:
