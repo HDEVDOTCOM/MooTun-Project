@@ -171,6 +171,14 @@ def _is_analysis_separator(character: str) -> bool:
     return character.isspace() or unicodedata.category(character).startswith("P")
 
 
+def _normalize_intent_analysis(text: str) -> str:
+    normalized = "".join(
+        " " if _is_analysis_separator(character) else character
+        for character in text
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def _invalid_amount_reason(text: str) -> str | None:
     if re.search(rf"(?<![\d/])[-−]\s*{_AMOUNT_PATTERN}", text):
         return "จำนวนเงินต้องมากกว่า 0"
@@ -238,7 +246,7 @@ def _display_text(text: str) -> str:
 
 
 def _transaction_intent_rejection(text: str) -> str | None:
-    intent_text = re.sub(r"\s+", "", text)
+    intent_text = re.sub(r"\s+", "", _normalize_intent_analysis(text))
     if any(re.search(pattern, intent_text) for pattern in _NEGATED_TRANSACTION_PATTERNS):
         return "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก"
 
@@ -287,7 +295,10 @@ def _leading_action_direction(text: str) -> TransactionType | None:
 
 
 def _has_linked_direction_conflict(text: str) -> bool:
-    clauses = re.split(r"(?:แล้ว|และ|จากนั้น)\s*", text)
+    clauses = re.split(
+        r"(?:แล้ว|และ|จากนั้น)\s*",
+        _normalize_intent_analysis(text),
+    )
     if len(clauses) < 2:
         return False
     directions = {

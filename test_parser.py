@@ -544,6 +544,25 @@ class ConservativeParsingTests(unittest.TestCase):
                     "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
                 )
 
+    def test_punctuation_wrapped_linked_actions_remain_conflicts(self) -> None:
+        examples = (
+            "จ่ายข้าวแล้ว (ได้เงิน 50 บาท)",
+            "ได้เงินแล้ว (จ่ายข้าว 50 บาท)",
+            "จ่ายข้าวแล้ว (ได้เงิน) 50 บาท",
+            "จ่ายข้าวแล้ว[ได้เงิน 50 บาท]",
+            "ได้เงินแล้ว【จ่ายข้าว 50 บาท】",
+            "จ่ายข้าวแล้ว（ได้เงิน 50 บาท）",
+            "จ่ายข้าวแล้ว,ได้เงิน 50 บาท",
+            "ได้เงินแล้ว; [จ่ายข้าว 50 บาท]",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
+                )
+
     def test_unknown_text(self) -> None:
         self.assert_unresolved("สวัสดี", CommandKind.UNKNOWN)
 
@@ -709,6 +728,59 @@ class ConservativeParsingTests(unittest.TestCase):
                     command.reason,
                     "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
                 )
+
+    def test_punctuation_wrapped_salary_intent_remains_unresolved(self) -> None:
+        negated = (
+            "เงินเดือน (ยังไม่เข้า 20000 บาท)",
+            "เงินเดือน[ยังไม่เข้า 20000 บาท]",
+            "เงินเดือน【ยังไม่เข้า 20000 บาท】",
+            "เงินเดือน;[ยังไม่เข้า 20000 บาท]",
+        )
+        for text in negated:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+                )
+
+        future = (
+            "เงินเดือน (จะเข้า 20000 บาท)",
+            "เงินเดือน[จะเข้า 20000 บาท]",
+            "เงินเดือน（จะเข้า 20000 บาท）",
+            "เงินเดือน,จะเข้า 20000 บาท",
+        )
+        for text in future:
+            with self.subTest(text=text):
+                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
+                self.assertEqual(
+                    command.reason,
+                    "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
+                )
+
+    def test_analysis_punctuation_normalization_preserves_descriptions(self) -> None:
+        examples = (
+            (
+                "จ่ายกาแฟ(เย็น),แก้วใหญ่ 50",
+                "50",
+                "อาหาร",
+                "กาแฟ(เย็น),แก้วใหญ่",
+            ),
+            (
+                "จ่ายค่าเน็ต[บ้าน];รอบเดือน 599",
+                "599",
+                "บิลและบริการ",
+                "ค่าเน็ต[บ้าน];รอบเดือน",
+            ),
+        )
+        for text, amount, category, description in examples:
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, TransactionCommand)
+                self.assertEqual(command.kind, CommandKind.EXPENSE)
+                self.assertEqual(command.amount, Decimal(amount))
+                self.assertEqual(command.category, category)
+                self.assertEqual(command.description, description)
 
     def test_unknown_transfer_direction_is_not_guessed(self) -> None:
         command = self.assert_unresolved("โอน 500", CommandKind.AMBIGUOUS)
