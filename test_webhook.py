@@ -110,6 +110,55 @@ def test_redelivery_is_idempotent_but_distinct_same_text_is_recorded(webhook_cli
     assert [reply[0] for reply in replies] == ["reply-evt-1", "reply-evt-2"]
 
 
+def test_postgresql_claim_does_not_depend_on_insert_rowcount(
+    webhook_client,
+    monkeypatch,
+):
+    client, engine, replies = webhook_client
+    original_execute = Session.execute
+
+    class InsertResultWithUnknownRowcount:
+        rowcount = -1
+
+        def __init__(self, result):
+            self._result = result
+
+        def scalar_one_or_none(self):
+            return self._result.scalar_one_or_none()
+
+        def __getattr__(self, name):
+            return getattr(self._result, name)
+
+    def hide_insert_rowcount(session, statement, *args, **kwargs):
+        result = original_execute(session, statement, *args, **kwargs)
+        if (
+            getattr(statement, "is_insert", False)
+            and statement.table.name == "processed_webhook_events"
+        ):
+            return InsertResultWithUnknownRowcount(result)
+        return result
+
+    monkeypatch.setattr(engine.dialect, "name", "postgresql")
+    monkeypatch.setattr(Session, "execute", hide_insert_rowcount)
+
+    assert _post_text(client, "evt-postgresql", "U-alice", "ข้าว 1234").status_code == 200
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        event = session.get(ProcessedWebhookEvent, "evt-postgresql")
+        assert item is not None
+        assert item.line_user_id == "U-alice"
+        assert item.amount_satang == 123400
+        assert event is not None
+        assert event.response_text
+        assert event.reply_sent is True
+    assert [reply[0] for reply in replies] == ["reply-evt-postgresql"]
+
+    assert _post_text(client, "evt-postgresql", "U-alice", "ข้าว 1234").status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+    assert [reply[0] for reply in replies] == ["reply-evt-postgresql"]
+
+
 def test_reply_failure_returns_502_and_redelivery_retries_saved_response(
     webhook_client, monkeypatch
 ):

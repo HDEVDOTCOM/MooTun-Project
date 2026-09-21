@@ -421,12 +421,15 @@ def mark_webhook_processed(
             db.flush()
             return result.rowcount == 1
         if dialect_name == "postgresql":
-            statement = postgresql_insert(ProcessedWebhookEvent).values(
-                webhook_event_id=event_id
-            ).on_conflict_do_nothing(index_elements=["webhook_event_id"])
+            statement = (
+                postgresql_insert(ProcessedWebhookEvent)
+                .values(webhook_event_id=event_id)
+                .on_conflict_do_nothing(index_elements=["webhook_event_id"])
+                .returning(ProcessedWebhookEvent.webhook_event_id)
+            )
             result = db.execute(statement)
             db.flush()
-            return result.rowcount == 1
+            return result.scalar_one_or_none() is not None
         try:
             # A SAVEPOINT contains the uniqueness error when the caller supplied
             # a session that is doing other work in the same transaction.
