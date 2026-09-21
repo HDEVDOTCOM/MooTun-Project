@@ -20,6 +20,9 @@ from messages import (
     format_buddhist_month,
     format_help_message,
     format_monthly_summary,
+    format_invalid_followup,
+    format_pending_conflict,
+    format_pending_transaction_prompt,
     format_recent_transactions,
     format_savings_goal,
     format_transaction_confirmation,
@@ -27,18 +30,25 @@ from messages import (
 )
 from parser import (
     CommandKind,
+    FOLLOWUP_CONFLICT_REASON,
+    IncompleteCommand,
     SavingsGoalCommand,
     SavingsProgressCommand,
     SimpleCommand,
     TransactionCommand,
     UnresolvedCommand,
     parse_command,
+    parse_followup,
 )
 from repository import (
+    PendingTransactionConflictError,
     add_savings_progress,
     add_transaction,
+    create_pending_transaction,
+    delete_pending_transaction,
     delete_latest_transaction,
     get_savings_goal,
+    get_pending_transaction,
     get_webhook_event,
     list_recent_transactions,
     mark_webhook_processed,
@@ -46,6 +56,7 @@ from repository import (
     monthly_summary,
     set_savings_goal,
     set_webhook_response,
+    update_pending_transaction,
 )
 
 
@@ -106,6 +117,10 @@ def _event_datetime(timestamp_ms: object) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _thai_month_label(moment: datetime) -> str:
     local = moment.astimezone(BANGKOK)
     return format_buddhist_month(local)
@@ -119,7 +134,101 @@ def handle_text_message(
 ) -> str:
     """Run one verified user's command and return a Thai LINE reply."""
 
+    processing_time = _utc_now()
+    try:
+        pending = get_pending_transaction(
+            line_user_id,
+            now=processing_time,
+            session=session,
+        )
+    except PendingTransactionConflictError:
+        return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    if pending is not None and text.strip().lower() == "ยกเลิก":
+        if not delete_pending_transaction(
+            line_user_id,
+            pending.version,
+            expected_draft_id=pending.draft_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+        return "ยกเลิกรายการที่ค้างไว้แล้วครับ"
+
     command = parse_command(text, now=event_time)
+
+    if pending is not None and isinstance(command, TransactionCommand):
+        if not delete_pending_transaction(
+            line_user_id,
+            pending.version,
+            expected_draft_id=pending.draft_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+
+    if pending is not None and isinstance(
+        command,
+        (IncompleteCommand, UnresolvedCommand),
+    ):
+        draft = IncompleteCommand(
+            pending.transaction_type,
+            pending.amount,
+            pending.category,
+            pending.occurred_on,
+            pending.description,
+            pending.inference_rule,
+        )
+        followup = parse_followup(draft, text, now=event_time)
+        if isinstance(followup, TransactionCommand):
+            if not delete_pending_transaction(
+                line_user_id,
+                pending.version,
+                expected_draft_id=pending.draft_id,
+                now=_utc_now(),
+                session=session,
+            ):
+                return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+            command = followup
+        elif isinstance(followup, IncompleteCommand):
+            if not update_pending_transaction(
+                line_user_id,
+                pending.version,
+                expected_draft_id=pending.draft_id,
+                transaction_type=followup.transaction_type,
+                amount=followup.amount,
+                category=followup.category,
+                description=followup.description,
+                inference_rule=followup.inference_rule,
+                now=_utc_now(),
+                session=session,
+            ):
+                return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+            return format_pending_transaction_prompt(
+                amount=followup.amount,
+                description=followup.description,
+            )
+        elif followup.reason == FOLLOWUP_CONFLICT_REASON:
+            return format_pending_conflict()
+        else:
+            return format_invalid_followup()
+
+    if isinstance(command, IncompleteCommand):
+        if not create_pending_transaction(
+            line_user_id,
+            transaction_type=command.transaction_type,
+            amount=command.amount,
+            category=command.category,
+            description=command.description,
+            occurred_on=command.transaction_date,
+            inference_rule=command.inference_rule,
+            now=processing_time,
+            session=session,
+        ):
+            return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+        return format_pending_transaction_prompt(
+            amount=command.amount,
+            description=command.description,
+        )
 
     if isinstance(command, TransactionCommand):
         item = add_transaction(

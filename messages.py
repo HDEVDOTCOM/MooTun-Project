@@ -194,6 +194,25 @@ def format_unknown_message(reason: str | None = None) -> str:
     )
 
 
+def format_pending_transaction_prompt(
+    *,
+    amount: object | None,
+    description: str | None,
+) -> str:
+    if amount is None:
+        item = _clean(description, "รายการนี้")
+        return f"{item} ราคาเท่าไหร่ครับ? เช่น 50"
+    return f"{format_amount(amount)} บาท เป็นรายรับหรือรายจ่ายครับ?"
+
+
+def format_pending_conflict() -> str:
+    return 'ข้อมูลนี้ขัดกับรายการที่ค้างไว้ครับ กรุณาส่งข้อมูลที่ขาด หรือพิมพ์ "ยกเลิก"'
+
+
+def format_invalid_followup() -> str:
+    return 'ยังบันทึกไม่ได้ครับ กรุณาระบุข้อมูลที่ขาด หรือพิมพ์ "ยกเลิก"'
+
+
 def format_help_message() -> str:
     return (
         "🐷 วิธีใช้หมูตุ๋น\n\n"

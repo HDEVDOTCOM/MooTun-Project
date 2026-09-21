@@ -1,17 +1,21 @@
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, update
 from sqlalchemy.orm import Session
 
-from models import Base
+from models import Base, PendingTransaction
 from database import init_db
 from repository import (
+    PendingTransactionConflictError,
     add_savings_progress,
     add_transaction,
     baht_to_satang,
     delete_latest_transaction,
+    delete_pending_transaction,
+    create_pending_transaction,
+    get_pending_transaction,
     get_savings_goal,
     get_webhook_event,
     list_recent_transactions,
@@ -20,6 +24,7 @@ from repository import (
     monthly_summary,
     set_savings_goal,
     set_webhook_response,
+    update_pending_transaction,
 )
 
 
@@ -137,3 +142,249 @@ def test_init_db_upgrades_legacy_webhook_table(tmp_path):
     columns = {item["name"] for item in inspect(engine).get_columns("processed_webhook_events")}
     assert {"response_text", "reply_sent"}.issubset(columns)
     engine.dispose()
+
+
+def test_init_db_upgrades_pending_transaction_table(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-pending.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE pending_transactions ("
+                "line_user_id VARCHAR(128) PRIMARY KEY)"
+            )
+        )
+
+    init_db(engine)
+
+    columns = {item["name"] for item in inspect(engine).get_columns("pending_transactions")}
+    assert "inference_rule" in columns
+    engine.dispose()
+
+
+def test_pending_transaction_lifecycle_uses_version_and_expiry(db_session):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    assert create_pending_transaction(
+        "U-alice",
+        transaction_type="expense",
+        amount=None,
+        category="อาหาร",
+        description="ข้าว",
+        occurred_on=date(2026, 9, 14),
+        now=now,
+        session=db_session,
+    )
+    pending = get_pending_transaction("U-alice", now=now, session=db_session)
+    assert pending is not None
+    assert pending.version == 1
+    draft_id = pending.draft_id
+    original_created_at = pending.created_at
+
+    assert update_pending_transaction(
+        "U-alice",
+        1,
+        expected_draft_id=draft_id,
+        transaction_type="expense",
+        amount="50",
+        category="อาหาร",
+        description="ข้าว",
+        now=now + timedelta(minutes=30),
+        session=db_session,
+    )
+    assert not update_pending_transaction(
+        "U-alice",
+        1,
+        expected_draft_id=draft_id,
+        transaction_type="income",
+        amount="500",
+        category="รายรับอื่นๆ",
+        description=None,
+        now=now + timedelta(minutes=31),
+        session=db_session,
+    )
+    pending = db_session.get(PendingTransaction, "U-alice")
+    db_session.refresh(pending)
+    assert pending.version == 2
+    assert pending.created_at == original_created_at
+    assert pending.amount_satang == 5000
+    assert pending.expires_at.replace(tzinfo=timezone.utc) == now + timedelta(minutes=90)
+    assert not delete_pending_transaction(
+        "U-alice",
+        1,
+        expected_draft_id=draft_id,
+        now=now + timedelta(minutes=31),
+        session=db_session,
+    )
+    assert delete_pending_transaction(
+        "U-alice",
+        2,
+        expected_draft_id=draft_id,
+        now=now + timedelta(minutes=31),
+        session=db_session,
+    )
+
+
+def test_pending_creation_is_first_successful_create_wins(db_session):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    arguments = {
+        "transaction_type": None,
+        "amount": "500",
+        "category": None,
+        "description": None,
+        "occurred_on": date(2026, 9, 14),
+        "now": now,
+        "session": db_session,
+    }
+    assert create_pending_transaction("U-alice", **arguments)
+    assert not create_pending_transaction("U-alice", **arguments)
+    assert db_session.get(PendingTransaction, "U-alice").version == 1
+
+
+def test_recreated_pending_transaction_rejects_stale_incarnation(db_session):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    arguments = {
+        "transaction_type": None,
+        "amount": "500",
+        "category": None,
+        "description": None,
+        "occurred_on": date(2026, 9, 14),
+        "session": db_session,
+    }
+    assert create_pending_transaction("U-alice", now=now, **arguments)
+    original = db_session.get(PendingTransaction, "U-alice")
+    original_draft_id = original.draft_id
+    assert delete_pending_transaction(
+        "U-alice",
+        original.version,
+        expected_draft_id=original_draft_id,
+        now=now,
+        session=db_session,
+    )
+
+    assert create_pending_transaction(
+        "U-alice",
+        now=now + timedelta(minutes=1),
+        **arguments,
+    )
+    replacement = db_session.get(PendingTransaction, "U-alice")
+    db_session.refresh(replacement)
+    assert replacement.version == 1
+    assert replacement.draft_id != original_draft_id
+
+    assert not update_pending_transaction(
+        "U-alice",
+        1,
+        expected_draft_id=original_draft_id,
+        transaction_type="expense",
+        amount="500",
+        category="อื่นๆ",
+        description=None,
+        now=now + timedelta(minutes=2),
+        session=db_session,
+    )
+    assert not delete_pending_transaction(
+        "U-alice",
+        1,
+        expected_draft_id=original_draft_id,
+        now=now + timedelta(minutes=2),
+        session=db_session,
+    )
+    assert db_session.get(PendingTransaction, "U-alice").draft_id == replacement.draft_id
+
+
+def test_expired_pending_transaction_cannot_be_updated_or_deleted(db_session):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    assert create_pending_transaction(
+        "U-alice",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 14),
+        now=now,
+        session=db_session,
+    )
+    pending = db_session.get(PendingTransaction, "U-alice")
+    expires_at = now + timedelta(hours=1)
+
+    assert not update_pending_transaction(
+        "U-alice",
+        pending.version,
+        expected_draft_id=pending.draft_id,
+        transaction_type="expense",
+        amount="500",
+        category="อื่นๆ",
+        description=None,
+        now=expires_at,
+        session=db_session,
+    )
+    assert not delete_pending_transaction(
+        "U-alice",
+        pending.version,
+        expected_draft_id=pending.draft_id,
+        now=expires_at,
+        session=db_session,
+    )
+
+
+def test_expired_pending_transaction_is_lazily_deleted(db_session):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    assert create_pending_transaction(
+        "U-alice",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 14),
+        now=now,
+        session=db_session,
+    )
+    assert get_pending_transaction(
+        "U-alice", now=now + timedelta(hours=1), session=db_session
+    ) is None
+    assert db_session.get(PendingTransaction, "U-alice") is None
+
+
+def test_failed_lazy_expiry_delete_surfaces_concurrent_modification(
+    db_session,
+    monkeypatch,
+):
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    assert create_pending_transaction(
+        "U-alice",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 14),
+        now=now,
+        session=db_session,
+    )
+    original_execute = db_session.execute
+    refreshed_expiry = now + timedelta(hours=2)
+
+    def refresh_before_delete(statement, *args, **kwargs):
+        if getattr(statement, "is_delete", False):
+            original_execute(
+                update(PendingTransaction)
+                .where(PendingTransaction.line_user_id == "U-alice")
+                .values(version=2, expires_at=refreshed_expiry)
+                .execution_options(synchronize_session=False)
+            )
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", refresh_before_delete)
+    with pytest.raises(
+        PendingTransactionConflictError,
+        match="pending transaction changed during expiry cleanup",
+    ):
+        get_pending_transaction(
+            "U-alice",
+            now=now + timedelta(hours=1),
+            session=db_session,
+        )
+
+    db_session.expire_all()
+    pending = db_session.get(PendingTransaction, "U-alice")
+    assert pending is not None
+    assert pending.version == 2
+    assert pending.expires_at.replace(tzinfo=timezone.utc) == refreshed_expiry

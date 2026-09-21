@@ -17,6 +17,10 @@ LINE user ID) → `messages.py` (Thai reply formatting).
 `line_api.py` handles signature verification and replies; `database.py`/`models.py`
 hold the SQLAlchemy engine and tables.
 
+Phase 1B stores at most one incomplete transaction per user in
+`pending_transactions`. `parser.parse_followup()` safety-checks each new message and
+merges structured evidence only; never concatenate draft text with follow-up text.
+
 - Tests and docs live at repo root (`test_*.py`, `PRODUCT_SPEC.md`, `PILOT_TEST.md`) —
   the directory layout in README.md is outdated.
 
@@ -32,15 +36,23 @@ hold the SQLAlchemy engine and tables.
 - Explicit transaction direction takes precedence over semantic inference when the
   explicit command is valid and unambiguous.
 - Month boundaries and summaries use Asia/Bangkok; display years are B.E. (+543).
+- Pending transactions expire after one hour. Useful mutations refresh `expires_at`
+  and increment `version`; invalid/conflicting input and stateless commands do neither.
+- Pending-state operations use an immutable draft identity plus version-based optimistic
+  concurrency control, and reject expired rows atomically. An OCC loser receives a
+  deterministic retry response that is cached with the webhook event and is never
+  automatically reinterpreted.
 
 ## Database quirks
 
-- No Alembic. `init_db()` runs `create_all` plus a hand-rolled column migration
-  (`_upgrade_webhook_event_table` in database.py). Schema changes must extend that path.
+- No Alembic. `init_db()` runs `create_all` plus hand-rolled column migrations in
+  `database.py`. Schema changes must extend that path.
 - `postgres://` and `postgresql://` URLs are rewritten to `postgresql+psycopg://`
   in `normalize_database_url`.
 - Tests never touch the real DB: they build tmp_path SQLite engines, and webhook tests
   call `configure_database()` + monkeypatch `app_module` attributes (see test_webhook.py).
+- Concurrent pending creation is first-successful-create-wins. Insert inside a nested
+  savepoint and contain `IntegrityError` so the outer webhook transaction remains usable.
 - `ENVIRONMENT=production` makes the app fail at startup if LINE/DB env vars are missing.
 
 ## Secrets

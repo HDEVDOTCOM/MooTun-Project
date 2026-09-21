@@ -4,12 +4,15 @@ import unittest
 
 from parser import (
     CommandKind,
+    FOLLOWUP_CONFLICT_REASON,
+    IncompleteCommand,
     SavingsGoalCommand,
     SavingsProgressCommand,
     SimpleCommand,
     TransactionCommand,
     UnresolvedCommand,
     parse_command,
+    parse_followup,
 )
 
 
@@ -433,15 +436,79 @@ class ConservativeParsingTests(unittest.TestCase):
         self.assertEqual(command.kind, kind)
         return command
 
-    def test_amount_only_does_not_guess_type(self) -> None:
+    def test_amount_only_creates_typed_incomplete_state(self) -> None:
         for text in ("500", "50.50", "1,200", "๑๐๐"):
             with self.subTest(text=text):
-                command = self.assert_unresolved(text, CommandKind.AMBIGUOUS)
-                self.assertEqual(command.reason, "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, IncompleteCommand)
+                self.assertIsNone(command.transaction_type)
+                self.assertIsNotNone(command.amount)
+                self.assertIsNone(command.description)
 
-    def test_known_item_without_amount_asks_for_amount(self) -> None:
-        command = self.assert_unresolved("ข้าว", CommandKind.AMBIGUOUS)
-        self.assertEqual(command.reason, "กรุณาระบุจำนวนเงินของ ข้าว")
+    def test_known_item_without_amount_creates_typed_incomplete_state(self) -> None:
+        command = parse_command("ข้าว", now=TODAY)
+        self.assertEqual(
+            command,
+            IncompleteCommand(
+                "expense",
+                None,
+                "อาหาร",
+                TODAY,
+                "ข้าว",
+                "expense.food",
+            ),
+        )
+
+    def test_followup_structurally_completes_missing_amount(self) -> None:
+        draft = parse_command("ข้าว", now=TODAY)
+        self.assertIsInstance(draft, IncompleteCommand)
+        command = parse_followup(draft, "50", now=TODAY)
+        self.assertIsInstance(command, TransactionCommand)
+        self.assertEqual(command.kind, CommandKind.EXPENSE)
+        self.assertEqual(command.amount, Decimal("50"))
+        self.assertEqual(command.description, "ข้าว")
+        self.assertEqual(command.category, "อาหาร")
+
+    def test_amount_only_followup_uses_direction_fallbacks(self) -> None:
+        draft = parse_command("500", now=TODAY)
+        self.assertIsInstance(draft, IncompleteCommand)
+        command = parse_followup(draft, "รายจ่าย", now=TODAY)
+        self.assertIsInstance(command, TransactionCommand)
+        self.assertEqual(command.kind, CommandKind.EXPENSE)
+        self.assertEqual(command.category, "อื่นๆ")
+        self.assertEqual(command.description, "ไม่ระบุรายการ")
+
+    def test_followup_conflict_is_explicit(self) -> None:
+        draft = parse_command("ข้าว", now=TODAY)
+        self.assertIsInstance(draft, IncompleteCommand)
+        command = parse_followup(draft, "รายรับ", now=TODAY)
+        self.assertIsInstance(command, UnresolvedCommand)
+        self.assertEqual(command.reason, FOLLOWUP_CONFLICT_REASON)
+
+    def test_explicit_draft_direction_overrides_followup_semantics(self) -> None:
+        draft = parse_command("จ่าย", now=TODAY)
+        self.assertIsInstance(draft, IncompleteCommand)
+        command = parse_followup(draft, "เงินเดือน", now=TODAY)
+        self.assertIsInstance(command, IncompleteCommand)
+        self.assertEqual(command.transaction_type, "expense")
+        self.assertEqual(command.description, "เงินเดือน")
+
+    def test_followup_dates_use_followup_time_but_preserve_draft_date(self) -> None:
+        draft = parse_command("ข้าว", now=TODAY)
+        self.assertIsInstance(draft, IncompleteCommand)
+        next_day = datetime(2026, 9, 15, 3, 0, tzinfo=timezone.utc)
+
+        implicit = parse_followup(draft, "50", now=next_day)
+        self.assertIsInstance(implicit, TransactionCommand)
+        self.assertEqual(implicit.transaction_date, TODAY)
+
+        today = parse_followup(draft, "วันนี้ 50", now=next_day)
+        self.assertIsInstance(today, UnresolvedCommand)
+        self.assertEqual(today.reason, FOLLOWUP_CONFLICT_REASON)
+
+        yesterday = parse_followup(draft, "เมื่อวาน 50", now=next_day)
+        self.assertIsInstance(yesterday, TransactionCommand)
+        self.assertEqual(yesterday.transaction_date, TODAY)
 
     def test_negative_amount_is_not_silently_made_positive(self) -> None:
         for text in ("จ่าย -50 ข้าว", "ข้าว −50"):

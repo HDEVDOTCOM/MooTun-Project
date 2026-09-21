@@ -8,19 +8,27 @@ from __future__ import annotations
 
 from calendar import monthrange
 from contextlib import nullcontext
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import init_db, session_scope
-from models import ProcessedWebhookEvent, SavingsGoal, Transaction
+from models import PendingTransaction, ProcessedWebhookEvent, SavingsGoal, Transaction
 
 
 MoneyInput = Decimal | int | str
+PENDING_TRANSACTION_TTL = timedelta(hours=1)
+
+
+class PendingTransactionConflictError(RuntimeError):
+    """A pending draft changed while the current operation was in progress."""
 
 
 def baht_to_satang(amount: MoneyInput) -> int:
@@ -247,6 +255,149 @@ def add_savings_progress(
         return goal
 
 
+def get_pending_transaction(
+    line_user_id: str,
+    *,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> PendingTransaction | None:
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+
+    with _session_context(session) as db:
+        pending = db.get(PendingTransaction, user_id)
+        if pending is None:
+            return None
+        expires_at = pending.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at > current_time:
+            return pending
+        result = db.execute(
+            delete(PendingTransaction).where(
+                PendingTransaction.line_user_id == user_id,
+                PendingTransaction.draft_id == pending.draft_id,
+                PendingTransaction.version == pending.version,
+                PendingTransaction.expires_at <= pending.expires_at,
+            )
+        )
+        db.flush()
+        if result.rowcount == 0:
+            raise PendingTransactionConflictError(
+                "pending transaction changed during expiry cleanup"
+            )
+        return None
+
+
+def create_pending_transaction(
+    line_user_id: str,
+    *,
+    transaction_type: str | None,
+    amount: MoneyInput | None,
+    category: str | None,
+    description: str | None,
+    occurred_on: date,
+    inference_rule: str | None = None,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    user_id = _validate_user_id(line_user_id)
+    if transaction_type not in {None, "income", "expense"}:
+        raise ValueError("transaction_type must be 'income', 'expense', or None")
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    values = {
+        "line_user_id": user_id,
+        "draft_id": uuid4().hex,
+        "transaction_type": transaction_type,
+        "amount_satang": baht_to_satang(amount) if amount is not None else None,
+        "category": category,
+        "description": description,
+        "inference_rule": inference_rule,
+        "occurred_on": occurred_on,
+        "created_at": current_time,
+        "expires_at": current_time + PENDING_TRANSACTION_TTL,
+        "version": 1,
+    }
+    with _session_context(session) as db:
+        try:
+            with db.begin_nested():
+                db.execute(insert(PendingTransaction).values(**values))
+                db.flush()
+        except IntegrityError:
+            return False
+        return True
+
+
+def update_pending_transaction(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_draft_id: str,
+    transaction_type: str | None,
+    amount: MoneyInput | None,
+    category: str | None,
+    description: str | None,
+    inference_rule: str | None = None,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            update(PendingTransaction)
+            .where(
+                PendingTransaction.line_user_id == user_id,
+                PendingTransaction.draft_id == expected_draft_id,
+                PendingTransaction.version == expected_version,
+                PendingTransaction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                transaction_type=transaction_type,
+                amount_satang=baht_to_satang(amount) if amount is not None else None,
+                category=category,
+                description=description,
+                inference_rule=inference_rule,
+                expires_at=current_time + PENDING_TRANSACTION_TTL,
+                version=expected_version + 1,
+            )
+        )
+        db.flush()
+        return result.rowcount == 1
+
+
+def delete_pending_transaction(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_draft_id: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            delete(PendingTransaction).where(
+                PendingTransaction.line_user_id == user_id,
+                PendingTransaction.draft_id == expected_draft_id,
+                PendingTransaction.version == expected_version,
+                PendingTransaction.expires_at > current_time,
+            ).execution_options(synchronize_session=False)
+        )
+        db.flush()
+        return result.rowcount == 1
+
+
 def mark_webhook_processed(
     webhook_event_id: str, *, session: Session | None = None
 ) -> bool:
@@ -261,6 +412,21 @@ def mark_webhook_processed(
         raise ValueError("webhook_event_id is required")
 
     with _session_context(session) as db:
+        dialect_name = db.get_bind().dialect.name
+        if dialect_name == "sqlite":
+            statement = sqlite_insert(ProcessedWebhookEvent).values(
+                webhook_event_id=event_id
+            ).on_conflict_do_nothing(index_elements=["webhook_event_id"])
+            result = db.execute(statement)
+            db.flush()
+            return result.rowcount == 1
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(ProcessedWebhookEvent).values(
+                webhook_event_id=event_id
+            ).on_conflict_do_nothing(index_elements=["webhook_event_id"])
+            result = db.execute(statement)
+            db.flush()
+            return result.rowcount == 1
         try:
             # A SAVEPOINT contains the uniqueness error when the caller supplied
             # a session that is doing other work in the same transaction.

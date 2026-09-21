@@ -65,6 +65,39 @@ class Transaction(Base):
         return Decimal(self.amount_satang) / Decimal(100)
 
 
+class PendingTransaction(Base):
+    __tablename__ = "pending_transactions"
+    __table_args__ = (
+        CheckConstraint(
+            "transaction_type IS NULL OR transaction_type IN ('income', 'expense')",
+            name="ck_pending_transactions_valid_type",
+        ),
+        CheckConstraint(
+            "amount_satang IS NULL OR amount_satang > 0",
+            name="ck_pending_transactions_positive_amount",
+        ),
+        CheckConstraint("version > 0", name="ck_pending_transactions_positive_version"),
+    )
+
+    line_user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    draft_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    transaction_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    amount_satang: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    inference_rule: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    occurred_on: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    @property
+    def amount(self) -> Decimal | None:
+        if self.amount_satang is None:
+            return None
+        return Decimal(self.amount_satang) / Decimal(100)
+
+
 class SavingsGoal(Base):
     __tablename__ = "savings_goals"
     __table_args__ = (

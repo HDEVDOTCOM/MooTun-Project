@@ -76,8 +76,19 @@ class UnresolvedCommand:
     reason: str
 
 
+@dataclass(frozen=True)
+class IncompleteCommand:
+    transaction_type: TransactionType | None
+    amount: Decimal | None
+    category: str | None
+    transaction_date: date
+    description: str | None
+    inference_rule: str | None
+
+
 ParsedCommand: TypeAlias = (
     TransactionCommand
+    | IncompleteCommand
     | SimpleCommand
     | SavingsGoalCommand
     | SavingsProgressCommand
@@ -86,6 +97,7 @@ ParsedCommand: TypeAlias = (
 
 
 _AMOUNT_PATTERN = r"(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d.])"
+_WRITTEN_DATE_PATTERN = r"(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(?!\d)"
 _EXPENSE_WORDS = ("รายจ่าย", "จ่าย", "ซื้อ", "เสีย")
 _INCOME_WORDS = ("รายรับ", "ได้รับ", "เงินเข้า", "รับ")
 _BOUNDARY_SENSITIVE_COMMANDS = {"รับ", "เสีย", "ได้รับ"}
@@ -213,9 +225,7 @@ def _parse_written_date(raw: str) -> date | None:
 
 def _extract_date(text: str, today: date) -> tuple[date | None, str, str | None]:
     relative_words = [word for word in ("วันนี้", "เมื่อวาน") if word in text]
-    written = list(
-        re.finditer(r"(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(?!\d)", text)
-    )
+    written = list(re.finditer(_WRITTEN_DATE_PATTERN, text))
     if len(relative_words) + len(written) > 1:
         return None, text, "พบวันที่มากกว่าหนึ่งค่า"
 
@@ -233,6 +243,12 @@ def _extract_date(text: str, today: date) -> tuple[date | None, str, str | None]
         return parsed, text.replace(word, " ", 1), None
 
     return today, text, None
+
+
+def _has_explicit_date(text: str) -> bool:
+    return any(word in text for word in ("วันนี้", "เมื่อวาน")) or bool(
+        re.search(_WRITTEN_DATE_PATTERN, text)
+    )
 
 
 def _normalize(text: str) -> str:
@@ -340,6 +356,9 @@ def _unresolved(reason: str, *, ambiguous: bool = True) -> UnresolvedCommand:
     )
 
 
+FOLLOWUP_CONFLICT_REASON = "ข้อมูลนี้ขัดกับรายการที่ค้างไว้ครับ กรุณาส่งข้อมูลที่ขาด หรือพิมพ์ \"ยกเลิก\""
+
+
 def parse_command(text: str, now: datetime | date | None = None) -> ParsedCommand:
     """Parse one Thai chat message into a typed command.
 
@@ -433,28 +452,60 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
         return _unresolved("พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน")
     if _has_unsupported_boundary_sensitive_command_prefix(command_text):
         return _unresolved("กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
-    if count == 0:
-        item_without_command = _strip_transaction_words(
-            display_without_date,
-            expense_word or income_word,
-        )
-        semantic = classify_item(item_without_command)
-        if expense or income or semantic is not None:
-            item_label = item_without_command.strip(" :-")
-            if item_label:
-                return _unresolved(f"กรุณาระบุจำนวนเงินของ {item_label}")
-            return _unresolved("กรุณาระบุจำนวนเงิน")
-        return _unresolved("ไม่รู้จักคำสั่ง", ambiguous=False)
-    leading_word = expense_word or income_word
-    description = _strip_transaction_words(display_without_amount, leading_word)
     explicit_type: TransactionType | None = None
     if expense:
         explicit_type = "expense"
     elif income:
         explicit_type = "income"
 
+    if count == 0:
+        item_without_command = _strip_transaction_words(
+            display_without_date,
+            expense_word or income_word,
+        )
+        semantic = classify_item(item_without_command, explicit_type=explicit_type)
+        if expense or income or semantic is not None:
+            item_label = item_without_command.strip(" :-")
+            if len(item_label) > 500:
+                return _unresolved("ชื่อรายการยาวเกิน 500 ตัวอักษร")
+            transaction_type = (
+                explicit_type if explicit_type is not None else semantic.transaction_type
+            )
+            category = (
+                semantic.category
+                if semantic is not None
+                else fallback_category(transaction_type)
+            )
+            rule = (
+                f"explicit.{expense_word or income_word}"
+                if explicit_type is not None
+                else semantic.rule_id
+            )
+            assert transaction_date is not None
+            return IncompleteCommand(
+                transaction_type,
+                None,
+                category,
+                transaction_date,
+                item_label or None,
+                rule,
+            )
+        return _unresolved("ไม่รู้จักคำสั่ง", ambiguous=False)
+    leading_word = expense_word or income_word
+    description = _strip_transaction_words(display_without_amount, leading_word)
+
     semantic = classify_item(description, explicit_type=explicit_type)
     if explicit_type is None and semantic is None:
+        if not description:
+            assert transaction_date is not None
+            return IncompleteCommand(
+                None,
+                amount,
+                None,
+                transaction_date,
+                None,
+                None,
+            )
         return _unresolved("กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
 
     transaction_type: TransactionType = (
@@ -490,8 +541,110 @@ def parse_command(text: str, now: datetime | date | None = None) -> ParsedComman
     )
 
 
+def parse_followup(
+    draft: IncompleteCommand,
+    text: str,
+    *,
+    now: datetime | date,
+) -> TransactionCommand | IncompleteCommand | UnresolvedCommand:
+    """Safety-check and merge structured evidence into an incomplete transaction."""
+
+    evidence = parse_command(text, now=now)
+    if isinstance(evidence, (SimpleCommand, SavingsGoalCommand, SavingsProgressCommand)):
+        return _unresolved("ยังไม่มีข้อมูลธุรกรรมที่ใช้เติมรายการ")
+    if isinstance(evidence, UnresolvedCommand):
+        return evidence
+
+    if isinstance(evidence, TransactionCommand):
+        evidence_type: TransactionType = evidence.kind.value
+        evidence_amount = evidence.amount
+        evidence_category: str | None = evidence.category
+        evidence_description = (
+            None if evidence.description == "ไม่ระบุรายการ" else evidence.description
+        )
+        evidence_rule: str | None = evidence.inference_rule
+        evidence_date = evidence.transaction_date
+    else:
+        evidence_type = evidence.transaction_type
+        evidence_amount = evidence.amount
+        evidence_category = evidence.category
+        evidence_description = evidence.description
+        evidence_rule = evidence.inference_rule
+        evidence_date = evidence.transaction_date
+
+    if _has_explicit_date(text) and evidence_date != draft.transaction_date:
+        return _unresolved(FOLLOWUP_CONFLICT_REASON)
+    if (
+        draft.transaction_type is not None
+        and evidence_type is not None
+        and draft.transaction_type != evidence_type
+        and not (
+            (draft.inference_rule or "").startswith("explicit.")
+            and not (evidence_rule or "").startswith("explicit.")
+        )
+    ):
+        return _unresolved(FOLLOWUP_CONFLICT_REASON)
+    if (
+        draft.amount is not None
+        and evidence_amount is not None
+        and draft.amount != evidence_amount
+    ):
+        return _unresolved(FOLLOWUP_CONFLICT_REASON)
+    if (
+        draft.description is not None
+        and evidence_description is not None
+        and draft.description != evidence_description
+    ):
+        return _unresolved(FOLLOWUP_CONFLICT_REASON)
+
+    transaction_type = draft.transaction_type or evidence_type
+    amount = draft.amount or evidence_amount
+    description = draft.description or evidence_description
+    changed = (
+        transaction_type != draft.transaction_type
+        or amount != draft.amount
+        or description != draft.description
+    )
+    if not changed:
+        return _unresolved("ยังไม่มีข้อมูลใหม่ที่ใช้เติมรายการ")
+
+    category = draft.category or evidence_category
+    inference_rule = draft.inference_rule or evidence_rule
+    if transaction_type is not None and description:
+        classification = classify_item(description, explicit_type=transaction_type)
+        if classification is not None:
+            category = classification.category
+            inference_rule = inference_rule or classification.rule_id
+    if transaction_type is not None and category is None:
+        category = fallback_category(transaction_type)
+
+    if transaction_type is None or amount is None:
+        return IncompleteCommand(
+            transaction_type,
+            amount,
+            category,
+            draft.transaction_date,
+            description,
+            inference_rule,
+        )
+
+    kind = (
+        CommandKind.EXPENSE if transaction_type == "expense" else CommandKind.INCOME
+    )
+    return TransactionCommand(
+        kind,
+        amount,
+        category or fallback_category(transaction_type),
+        draft.transaction_date,
+        description or "ไม่ระบุรายการ",
+        inference_rule or "followup.explicit_direction",
+    )
+
+
 __all__ = [
     "CommandKind",
+    "FOLLOWUP_CONFLICT_REASON",
+    "IncompleteCommand",
     "ParsedCommand",
     "SavingsGoalCommand",
     "SavingsProgressCommand",
@@ -499,4 +652,5 @@ __all__ = [
     "TransactionCommand",
     "UnresolvedCommand",
     "parse_command",
+    "parse_followup",
 ]

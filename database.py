@@ -56,6 +56,7 @@ def init_db(db_engine: Engine | None = None) -> None:
     active_engine = db_engine or engine
     Base.metadata.create_all(bind=active_engine)
     _upgrade_webhook_event_table(active_engine)
+    _upgrade_pending_transaction_table(active_engine)
 
 
 def _upgrade_webhook_event_table(db_engine: Engine) -> None:
@@ -76,6 +77,21 @@ def _upgrade_webhook_event_table(db_engine: Engine) -> None:
         with db_engine.begin() as connection:
             for statement in statements:
                 connection.execute(text(statement))
+
+
+def _upgrade_pending_transaction_table(db_engine: Engine) -> None:
+    """Add pending-state fields introduced before schema migrations exist."""
+
+    table_name = "pending_transactions"
+    columns = {column["name"] for column in inspect(db_engine).get_columns(table_name)}
+    if "inference_rule" not in columns:
+        with db_engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN inference_rule VARCHAR(100)"
+                )
+            )
 
 
 @contextmanager

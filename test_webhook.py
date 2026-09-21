@@ -2,17 +2,17 @@ import base64
 import hashlib
 import hmac
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 import app as app_module
 from database import configure_database
 from line_api import LineTransportError
-from models import ProcessedWebhookEvent, Transaction
+from models import PendingTransaction, ProcessedWebhookEvent, Transaction
 
 
 SECRET = "test-channel-secret"
@@ -44,6 +44,20 @@ def _text_event(
         "source": {"type": "user", "userId": user_id},
         "message": {"type": "text", "id": f"message-{event_id}", "text": text},
     }
+
+
+def _post_text(
+    client: TestClient,
+    event_id: str,
+    user_id: str,
+    text: str,
+    *,
+    timestamp: int = 1_789_359_600_000,
+):
+    body, headers = _signed_body(
+        {"events": [_text_event(event_id, user_id, text, timestamp=timestamp)]}
+    )
+    return client.post("/webhook", content=body, headers=headers)
 
 
 @pytest.fixture()
@@ -205,7 +219,353 @@ def test_ambiguous_natural_language_does_not_write_transaction(webhook_client):
 
     with Session(engine) as session:
         assert session.scalar(select(func.count(Transaction.id))) == 0
-    assert "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย" in replies[0][1]
+        assert session.get(PendingTransaction, "U-alice") is not None
+    assert replies[0][1] == "500 บาท เป็นรายรับหรือรายจ่ายครับ?"
+
+
+def test_item_then_amount_completes_pending_transaction(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-item", "U-alice", "ข้าว").status_code == 200
+    assert replies[-1][1] == "ข้าว ราคาเท่าไหร่ครับ? เช่น 50"
+
+    assert _post_text(client, "evt-amount", "U-alice", "50").status_code == 200
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.transaction_type == "expense"
+        assert item.amount_satang == 5000
+        assert item.description == "ข้าว"
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_amount_then_direction_uses_fallback_transaction_data(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-amount", "U-alice", "500").status_code == 200
+    assert _post_text(client, "evt-direction", "U-alice", "รายจ่าย").status_code == 200
+
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.transaction_type == "expense"
+        assert item.amount_satang == 50000
+        assert item.category == "อื่นๆ"
+        assert item.description == "ไม่ระบุรายการ"
+
+
+def test_conflict_preserves_pending_state_until_valid_followup(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-draft", "U-alice", "ข้าว").status_code == 200
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        original_state = (pending.version, pending.expires_at)
+
+    assert _post_text(client, "evt-conflict", "U-alice", "รายรับ").status_code == 200
+    assert replies[-1][1].startswith("ข้อมูลนี้ขัดกับรายการที่ค้างไว้ครับ")
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert (pending.version, pending.expires_at) == original_state
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+    assert _post_text(client, "evt-valid", "U-alice", "50").status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_stateless_command_preserves_pending_state(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-draft", "U-alice", "500").status_code == 200
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        original_state = (pending.version, pending.expires_at)
+
+    assert _post_text(client, "evt-summary", "U-alice", "สรุปเดือนนี้").status_code == 200
+    assert replies[-1][1].startswith("📊")
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert (pending.version, pending.expires_at) == original_state
+
+
+def test_complete_transaction_atomically_replaces_pending_draft(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-draft", "U-alice", "500").status_code == 200
+    assert _post_text(client, "evt-complete", "U-alice", "ข้าว 50").status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_transaction_failure_rolls_back_pending_deletion_and_event_claim(
+    webhook_client,
+    monkeypatch,
+):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-draft", "U-alice", "ข้าว").status_code == 200
+
+    def fail_transaction(*args, **kwargs):
+        raise RuntimeError("simulated transaction insert failure")
+
+    monkeypatch.setattr(app_module, "add_transaction", fail_transaction)
+    with pytest.raises(RuntimeError, match="simulated transaction insert failure"):
+        _post_text(client, "evt-complete-failure", "U-alice", "50")
+
+    with Session(engine) as session:
+        assert session.get(PendingTransaction, "U-alice") is not None
+        assert session.get(ProcessedWebhookEvent, "evt-complete-failure") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_cancel_is_conditional_on_an_active_pending_draft(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-no-draft", "U-alice", "ยกเลิก").status_code == 200
+    assert "ข้อความนี้เป็นการปฏิเสธ" in replies[-1][1]
+
+    assert _post_text(client, "evt-draft", "U-alice", "ข้าว").status_code == 200
+    assert _post_text(client, "evt-cancel", "U-alice", "ยกเลิก").status_code == 200
+    assert replies[-1][1] == "ยกเลิกรายการที่ค้างไว้แล้วครับ"
+    with Session(engine) as session:
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_expired_draft_is_not_used_as_followup_state(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-old", "U-alice", "ข้าว").status_code == 200
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        pending.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+
+    assert _post_text(client, "evt-after-expiry", "U-alice", "50").status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        assert pending.amount_satang == 5000
+        assert pending.transaction_type is None
+
+
+def test_draft_expiring_between_read_and_mutation_is_not_completed(
+    webhook_client,
+    monkeypatch,
+):
+    client, engine, replies = webhook_client
+    start = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    clock = iter(
+        (
+            start,
+            start + timedelta(minutes=59),
+            start + timedelta(minutes=61),
+        )
+    )
+    monkeypatch.setattr(app_module, "_utc_now", lambda: next(clock))
+
+    assert _post_text(client, "evt-expiry-draft", "U-alice", "ข้าว").status_code == 200
+    assert _post_text(client, "evt-expiry-complete", "U-alice", "50").status_code == 200
+    assert replies[-1][1] == (
+        "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    )
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert session.get(PendingTransaction, "U-alice") is not None
+
+
+@pytest.mark.parametrize("text", ["50", "ยกเลิก"])
+def test_lazy_expiry_occ_loser_does_not_reinterpret_against_replacement(
+    webhook_client,
+    monkeypatch,
+    text,
+):
+    client, engine, _ = webhook_client
+    now = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    replacement_expiry = now + timedelta(hours=1)
+    old_draft_id = "a" * 32
+    replacement_draft_id = "b" * 32
+    with Session(engine) as session:
+        session.add(
+            PendingTransaction(
+                line_user_id="U-alice",
+                draft_id=old_draft_id,
+                version=1,
+                transaction_type="expense",
+                amount_satang=None,
+                category="อาหาร",
+                description="ข้าว",
+                inference_rule="expense.food",
+                occurred_on=now.date(),
+                created_at=now - timedelta(hours=2),
+                expires_at=now - timedelta(hours=1),
+            )
+        )
+        session.commit()
+
+    original_execute = Session.execute
+    replaced = False
+
+    def replace_before_cleanup(session, statement, *args, **kwargs):
+        nonlocal replaced
+        is_pending_delete = (
+            getattr(statement, "is_delete", False)
+            and statement.table.name == "pending_transactions"
+        )
+        if is_pending_delete and not replaced:
+            replaced = True
+            original_execute(
+                session,
+                delete(PendingTransaction)
+                .where(PendingTransaction.line_user_id == "U-alice")
+                .execution_options(synchronize_session=False),
+            )
+            original_execute(
+                session,
+                insert(PendingTransaction).values(
+                    line_user_id="U-alice",
+                    draft_id=replacement_draft_id,
+                    version=7,
+                    transaction_type="income",
+                    amount_satang=None,
+                    category="เงินเดือน",
+                    description="เงินเดือน",
+                    inference_rule="income.salary",
+                    occurred_on=now.date(),
+                    created_at=now,
+                    expires_at=replacement_expiry,
+                ),
+            )
+        return original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_utc_now", lambda: now)
+    monkeypatch.setattr(Session, "execute", replace_before_cleanup)
+    attempts = []
+
+    async def fail_first_reply(reply_token, response_text, token):
+        attempts.append(response_text)
+        if len(attempts) == 1:
+            raise LineTransportError("simulated reply failure")
+
+    monkeypatch.setattr(app_module, "reply_text", fail_first_reply)
+
+    assert _post_text(client, "evt-expiry-loser", "U-alice", text).status_code == 502
+    retry_reply = "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert attempts == [retry_reply]
+
+    with Session(engine) as session:
+        replacement = session.get(PendingTransaction, "U-alice")
+        event = session.get(ProcessedWebhookEvent, "evt-expiry-loser")
+        assert replacement is not None
+        assert replacement.draft_id == replacement_draft_id
+        assert replacement.version == 7
+        assert replacement.transaction_type == "income"
+        assert replacement.amount_satang is None
+        assert replacement.description == "เงินเดือน"
+        assert replacement.expires_at.replace(tzinfo=timezone.utc) == replacement_expiry
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert event is not None
+        assert event.response_text == retry_reply
+        assert event.reply_sent is False
+
+    assert _post_text(client, "evt-expiry-loser", "U-alice", text).status_code == 200
+    assert attempts == [retry_reply, retry_reply]
+    with Session(engine) as session:
+        replacement = session.get(PendingTransaction, "U-alice")
+        event = session.get(ProcessedWebhookEvent, "evt-expiry-loser")
+        assert replacement is not None
+        assert replacement.draft_id == replacement_draft_id
+        assert replacement.version == 7
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert event is not None
+        assert event.response_text == retry_reply
+        assert event.reply_sent is True
+
+
+def test_followup_relative_date_uses_followup_event_time(webhook_client):
+    client, engine, replies = webhook_client
+    first_day = int(datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    next_day = int(datetime(2026, 9, 15, 3, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+    assert _post_text(
+        client,
+        "evt-date-draft",
+        "U-alice",
+        "ข้าว",
+        timestamp=first_day,
+    ).status_code == 200
+    assert _post_text(
+        client,
+        "evt-date-conflict",
+        "U-alice",
+        "วันนี้ 50",
+        timestamp=next_day,
+    ).status_code == 200
+    assert replies[-1][1].startswith("ข้อมูลนี้ขัดกับรายการที่ค้างไว้ครับ")
+
+    assert _post_text(
+        client,
+        "evt-date-complete",
+        "U-alice",
+        "เมื่อวาน 50",
+        timestamp=next_day,
+    ).status_code == 200
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.occurred_on == date(2026, 9, 14)
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_pending_transactions_are_isolated_by_user(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-alice", "U-alice", "ข้าว").status_code == 200
+    assert _post_text(client, "evt-bob", "U-bob", "500").status_code == 200
+    assert _post_text(client, "evt-alice-complete", "U-alice", "50").status_code == 200
+
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item.line_user_id == "U-alice"
+        assert session.get(PendingTransaction, "U-alice") is None
+        assert session.get(PendingTransaction, "U-bob") is not None
+
+
+def test_explicit_pending_direction_survives_semantic_followup(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-explicit", "U-alice", "จ่าย").status_code == 200
+    assert _post_text(client, "evt-semantic", "U-alice", "เงินเดือน").status_code == 200
+    assert replies[-1][1] == "เงินเดือน ราคาเท่าไหร่ครับ? เช่น 50"
+    assert _post_text(client, "evt-amount", "U-alice", "50").status_code == 200
+
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.transaction_type == "expense"
+        assert item.description == "เงินเดือน"
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_occ_loser_reply_is_cached_and_not_reinterpreted(
+    webhook_client, monkeypatch
+):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-draft", "U-alice", "ข้าว").status_code == 200
+    calls = 0
+
+    def lose_delete(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(app_module, "delete_pending_transaction", lose_delete)
+    assert _post_text(client, "evt-loser", "U-alice", "50").status_code == 200
+    loser_reply = replies[-1][1]
+    assert loser_reply == "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert calls == 1
+
+    with Session(engine) as session:
+        event = session.get(ProcessedWebhookEvent, "evt-loser")
+        assert event.response_text == loser_reply
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+    assert _post_text(client, "evt-loser", "U-alice", "50").status_code == 200
+    assert calls == 1
 
 
 def test_unsafe_rule_interactions_do_not_write_transactions(webhook_client):
