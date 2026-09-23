@@ -143,6 +143,59 @@ def delete_latest_transaction(
         return item
 
 
+def update_latest_transaction(
+    line_user_id: str,
+    transaction_type: str,
+    amount: MoneyInput,
+    category: str,
+    *,
+    description: str | None = None,
+    occurred_on: date | datetime | None = None,
+    session: Session | None = None,
+) -> Transaction | None:
+    """Replace every field of the user's most recently entered transaction.
+
+    The row is selected by entry order (``created_at DESC, id DESC``) so the
+    transaction the user just recorded is the one that changes; ``occurred_on``
+    is only overwritten when the caller supplies an explicit date.  Returns
+    ``None`` when the user has no transactions to edit.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    kind = transaction_type.strip().lower()
+    if kind not in {"income", "expense"}:
+        raise ValueError("transaction_type must be 'income' or 'expense'")
+    category_value = category.strip()
+    if not category_value:
+        raise ValueError("category is required")
+    if isinstance(occurred_on, datetime):
+        occurred_on = occurred_on.date()
+
+    statement = (
+        select(Transaction)
+        .where(Transaction.line_user_id == user_id)
+        .order_by(
+            Transaction.created_at.desc(),
+            Transaction.id.desc(),
+        )
+        .limit(1)
+    )
+    with _session_context(session) as db:
+        item = db.scalar(statement)
+        if item is None:
+            return None
+        item.transaction_type = kind
+        item.amount_satang = baht_to_satang(amount)
+        item.category = category_value
+        item.description = (
+            description.strip() if description and description.strip() else None
+        )
+        if occurred_on is not None:
+            item.occurred_on = occurred_on
+        db.flush()
+        return item
+
+
 def monthly_summary(
     line_user_id: str,
     year: int,

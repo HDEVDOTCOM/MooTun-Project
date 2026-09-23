@@ -89,6 +89,29 @@ def format_transaction_confirmation(transaction: Mapping[str, object]) -> str:
     return limit_line_text("\n".join(lines))
 
 
+def format_edit_confirmation(transaction: Mapping[str, object]) -> str:
+    """Confirm that the latest transaction was replaced in Thai."""
+
+    kind = _kind(transaction.get("type"))
+    amount = abs(_decimal(transaction.get("amount", 0)))
+    category = _clean(transaction.get("category"), "ไม่ระบุหมวด")
+    happened_on = _format_date(transaction.get("date"))
+
+    lines = [
+        f"✏️ แก้ไข{kind}ล่าสุดแล้ว",
+    ]
+    note = _clean(transaction.get("note"), "")
+    if note and note != "ไม่ระบุรายการ":
+        lines.append(f"รายการ: {note}")
+    lines.extend([
+        f"จำนวน: {format_amount(amount)} บาท",
+        f"หมวด: {category}",
+    ])
+    if happened_on:
+        lines.append(f"วันที่: {happened_on}")
+    return limit_line_text("\n".join(lines))
+
+
 def format_recent_transactions(
     transactions: Iterable[Mapping[str, object]],
     *,
@@ -223,6 +246,7 @@ def format_help_message() -> str:
         "ดูรายการ: รายการล่าสุด\n"
         "ดูสรุป: สรุปเดือนนี้\n"
         "ลบรายการ: ลบล่าสุด\n"
+        "แก้ไขรายการล่าสุด: แก้ไข ข้าว 60\n"
         "ตั้งเป้าหมาย: ตั้งเป้า 1500 ซื้อหนังสือ\n"
         "เพิ่มเงินออม: ออม 100\n"
         "ดูเป้าหมาย: เป้าหมายการออม"

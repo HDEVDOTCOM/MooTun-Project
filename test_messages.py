@@ -2,6 +2,7 @@ from datetime import date
 
 from messages import (
     format_amount,
+    format_edit_confirmation,
     format_help_message,
     format_monthly_summary,
     format_recent_transactions,
@@ -34,6 +35,24 @@ def test_confirmation_contains_clean_transaction_fields() -> None:
     assert "หมวด: อาหาร" in message
     assert "วันที่: 14/09/2569" in message
     assert "ข้าวกลางวัน โรงอาหาร" in message
+
+
+def test_edit_confirmation_contains_clean_transaction_fields() -> None:
+    message = format_edit_confirmation(
+        {
+            "type": "income",
+            "amount": "20000",
+            "category": "เงินเดือน",
+            "date": date(2026, 9, 14),
+            "note": "ไม่ระบุรายการ",
+        }
+    )
+
+    assert "แก้ไขรายรับล่าสุดแล้ว" in message
+    assert "จำนวน: 20,000 บาท" in message
+    assert "หมวด: เงินเดือน" in message
+    assert "วันที่: 14/09/2569" in message
+    assert "รายการ:" not in message
 
 
 def test_recent_transactions_handles_empty_and_mixed_items() -> None:

@@ -4,6 +4,9 @@ import unittest
 
 from parser import (
     CommandKind,
+    EDIT_INCOMPLETE_REASON,
+    EDIT_MISSING_DETAILS_REASON,
+    EditLatestCommand,
     FOLLOWUP_CONFLICT_REASON,
     IncompleteCommand,
     SavingsGoalCommand,
@@ -11,6 +14,7 @@ from parser import (
     SimpleCommand,
     TransactionCommand,
     UnresolvedCommand,
+    UnresolvedEditCommand,
     parse_command,
     parse_followup,
 )
@@ -852,6 +856,90 @@ class ConservativeParsingTests(unittest.TestCase):
     def test_unknown_transfer_direction_is_not_guessed(self) -> None:
         command = self.assert_unresolved("โอน 500", CommandKind.AMBIGUOUS)
         self.assertEqual(command.reason, "กรุณาระบุว่าเป็นรายรับหรือรายจ่าย")
+
+
+class EditLatestParsingTests(unittest.TestCase):
+    def test_edit_replaces_expense_fields(self) -> None:
+        command = parse_command("แก้ ข้าว 60", now=TODAY)
+
+        self.assertEqual(
+            command,
+            EditLatestCommand(
+                CommandKind.EDIT_LATEST,
+                "expense",
+                Decimal("60"),
+                "อาหาร",
+                "ข้าว",
+                TODAY,
+                False,
+                "expense.food",
+            ),
+        )
+
+    def test_edit_supports_income_direction(self) -> None:
+        command = parse_command("แก้ไข เงินเดือน 21000", now=TODAY)
+
+        self.assertIsInstance(command, EditLatestCommand)
+        self.assertEqual(command.transaction_type, "income")
+        self.assertEqual(command.amount, Decimal("21000"))
+        self.assertEqual(command.category, "เงินเดือน")
+
+    def test_boundary_collisions_are_not_edits(self) -> None:
+        for text in ("แก้", "แก้ไข", "แก้ข้าว 60", "แก้ไขข้าว 60", "แก้ว 60"):
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertNotIsInstance(
+                    command,
+                    (EditLatestCommand, UnresolvedEditCommand),
+                )
+
+    def test_incomplete_edit_is_rejected_not_pending(self) -> None:
+        for text in ("แก้ 50", "แก้ ข้าว"):
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, UnresolvedEditCommand)
+                self.assertEqual(command.reason, EDIT_INCOMPLETE_REASON)
+
+    def test_empty_edit_body_is_rejected(self) -> None:
+        for text in ("แก้ ", "แก้ไข\t"):
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, UnresolvedEditCommand)
+                self.assertEqual(command.reason, EDIT_MISSING_DETAILS_REASON)
+
+    def test_edit_preserves_phase_1a_safety_rejections(self) -> None:
+        examples = {
+            "แก้ ไม่ได้ซื้อข้าว 50": "ข้อความนี้เป็นการปฏิเสธ จึงยังไม่บันทึก",
+            "แก้ จะขายข้าว 50": "ข้อความนี้ดูเป็นรายการที่ยังไม่เกิดขึ้น จึงยังไม่บันทึก",
+            "แก้ ข้าว 1,00": "รูปแบบจำนวนเงินไม่ถูกต้อง",
+            "แก้ จ่าย 50 และรับ": "พบทั้งรายรับและรายจ่ายในข้อความเดียวกัน",
+        }
+        for text, reason in examples.items():
+            with self.subTest(text=text):
+                command = parse_command(text, now=TODAY)
+                self.assertIsInstance(command, UnresolvedEditCommand)
+                self.assertEqual(command.reason, reason)
+
+    def test_date_provenance_is_tracked_separately(self) -> None:
+        inherited = parse_command("แก้ไข ข้าว 60", now=TODAY)
+        self.assertIsInstance(inherited, EditLatestCommand)
+        self.assertFalse(inherited.explicit_occurred_on)
+
+        yesterday = parse_command("แก้ ข้าว 60 เมื่อวาน", now=TODAY)
+        self.assertIsInstance(yesterday, EditLatestCommand)
+        self.assertTrue(yesterday.explicit_occurred_on)
+        self.assertEqual(yesterday.transaction_date, date(2026, 9, 13))
+
+        written = parse_command("แก้ไข ข้าว 60 14/09/2569", now=TODAY)
+        self.assertIsInstance(written, EditLatestCommand)
+        self.assertTrue(written.explicit_occurred_on)
+        self.assertEqual(written.transaction_date, date(2026, 9, 14))
+
+    def test_edit_does_not_leak_into_followup_merge(self) -> None:
+        draft = IncompleteCommand("expense", None, "อาหาร", TODAY, "ข้าว", "expense.food")
+        followup = parse_followup(draft, "แก้ ข้าว 60", now=TODAY)
+
+        self.assertIsInstance(followup, UnresolvedCommand)
 
 
 if __name__ == "__main__":

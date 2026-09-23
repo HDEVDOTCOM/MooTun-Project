@@ -18,6 +18,7 @@ from line_api import LineAPIError, reply_text, verify_webhook_signature
 from messages import (
     format_buddhist_date,
     format_buddhist_month,
+    format_edit_confirmation,
     format_help_message,
     format_monthly_summary,
     format_invalid_followup,
@@ -30,6 +31,7 @@ from messages import (
 )
 from parser import (
     CommandKind,
+    EditLatestCommand,
     FOLLOWUP_CONFLICT_REASON,
     IncompleteCommand,
     SavingsGoalCommand,
@@ -37,6 +39,7 @@ from parser import (
     SimpleCommand,
     TransactionCommand,
     UnresolvedCommand,
+    UnresolvedEditCommand,
     parse_command,
     parse_followup,
 )
@@ -56,6 +59,7 @@ from repository import (
     monthly_summary,
     set_savings_goal,
     set_webhook_response,
+    update_latest_transaction,
     update_pending_transaction,
 )
 
@@ -155,6 +159,29 @@ def handle_text_message(
         return "ยกเลิกรายการที่ค้างไว้แล้วครับ"
 
     command = parse_command(text, now=event_time)
+
+    if isinstance(command, UnresolvedEditCommand):
+        return format_unknown_message(command.reason)
+
+    if isinstance(command, EditLatestCommand):
+        item = update_latest_transaction(
+            line_user_id,
+            command.transaction_type,
+            command.amount,
+            command.category,
+            description=(
+                None
+                if command.description == "ไม่ระบุรายการ"
+                else command.description
+            ),
+            occurred_on=(
+                command.transaction_date if command.explicit_occurred_on else None
+            ),
+            session=session,
+        )
+        if item is None:
+            return "ยังไม่มีรายการให้แก้ไข"
+        return format_edit_confirmation(_transaction_data(item))
 
     if pending is not None and isinstance(command, TransactionCommand):
         if not delete_pending_transaction(

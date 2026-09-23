@@ -301,6 +301,182 @@ def test_amount_then_direction_uses_fallback_transaction_data(webhook_client):
         assert item.description == "ไม่ระบุรายการ"
 
 
+def test_edit_latest_replaces_only_saved_transaction(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-seed", "U-alice", "ข้าว 50").status_code == 200
+    with Session(engine) as session:
+        seeded = session.scalar(select(Transaction))
+        assert seeded is not None
+        original_date = seeded.occurred_on
+
+    assert _post_text(client, "evt-edit", "U-alice", "แก้ไข ข้าวมันไก่ 120").status_code == 200
+
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction)))
+        assert len(items) == 1
+        assert items[0].amount_satang == 12000
+        assert items[0].category == "อาหาร"
+        assert items[0].description == "ข้าวมันไก่"
+        assert items[0].occurred_on == original_date
+    assert "แก้ไขรายจ่ายล่าสุดแล้ว" in replies[-1][1]
+    assert "จำนวน: 120 บาท" in replies[-1][1]
+
+
+def test_edit_latest_without_saved_transaction_is_rejected(webhook_client):
+    client, engine, replies = webhook_client
+
+    assert _post_text(client, "evt-no-latest", "U-alice", "แก้ไข ข้าว 60").status_code == 200
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert session.get(PendingTransaction, "U-alice") is None
+    assert replies[-1][1] == "ยังไม่มีรายการให้แก้ไข"
+
+
+def test_edit_latest_inherits_or_overrides_date(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-dated", "U-alice", "ข้าว 50 01/09/2569").status_code == 200
+
+    assert _post_text(client, "evt-edit-inherit", "U-alice", "แก้ ข้าว 60").status_code == 200
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.occurred_on == date(2026, 9, 1)
+
+    assert _post_text(client, "evt-edit-date", "U-alice", "แก้ ข้าว 70 02/09/2569").status_code == 200
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.amount_satang == 7000
+        assert item.occurred_on == date(2026, 9, 2)
+
+
+def test_edit_latest_does_not_mutate_pending_draft(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-saved", "U-alice", "ข้าว 50").status_code == 200
+    assert _post_text(client, "evt-draft", "U-alice", "กาแฟ").status_code == 200
+
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        original_pending = tuple(
+            getattr(pending, column.name) for column in PendingTransaction.__table__.columns
+        )
+
+    assert _post_text(client, "evt-edit-while-pending", "U-alice", "แก้ ข้าวมันไก่ 120").status_code == 200
+
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        assert item is not None
+        assert item.description == "ข้าวมันไก่"
+        assert item.amount_satang == 12000
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        assert tuple(
+            getattr(pending, column.name) for column in PendingTransaction.__table__.columns
+        ) == original_pending
+
+    assert _post_text(client, "evt-followup-after-edit", "U-alice", "50").status_code == 200
+    assert "รายการ: กาแฟ" in replies[-1][1]
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [(item.description, item.amount_satang) for item in items] == [
+            ("ข้าวมันไก่", 12000),
+            ("กาแฟ", 5000),
+        ]
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_incomplete_edit_preserves_saved_transaction_and_pending_draft(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-saved-invalid", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-draft-invalid", "U-alice", "กาแฟ").status_code == 200
+
+    with Session(engine) as session:
+        saved = session.scalar(select(Transaction))
+        pending = session.get(PendingTransaction, "U-alice")
+        assert saved is not None
+        assert pending is not None
+        original_saved = tuple(
+            getattr(saved, column.name) for column in Transaction.__table__.columns
+        )
+        original_pending = tuple(
+            getattr(pending, column.name) for column in PendingTransaction.__table__.columns
+        )
+
+    for index, text in enumerate(("แก้ 50", "แก้ ข้าว"), start=1):
+        assert _post_text(
+            client, f"evt-invalid-edit-{index}", "U-alice", text
+        ).status_code == 200
+        assert replies[-1][1].startswith(
+            "คำสั่งแก้ไขต้องระบุรายการและจำนวนเงินให้ครบในข้อความเดียวครับ"
+        )
+        with Session(engine) as session:
+            saved = session.scalar(select(Transaction))
+            pending = session.get(PendingTransaction, "U-alice")
+            assert saved is not None
+            assert pending is not None
+            assert tuple(
+                getattr(saved, column.name) for column in Transaction.__table__.columns
+            ) == original_saved
+            assert tuple(
+                getattr(pending, column.name)
+                for column in PendingTransaction.__table__.columns
+            ) == original_pending
+
+    assert _post_text(client, "evt-followup-after-invalid", "U-alice", "50").status_code == 200
+    assert "รายการ: กาแฟ" in replies[-1][1]
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [(item.description, item.amount_satang) for item in items] == [
+            ("ข้าว", 4000),
+            ("กาแฟ", 5000),
+        ]
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_edit_latest_redelivery_does_not_edit_intervening_latest(
+    webhook_client,
+    monkeypatch,
+):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-seed-idem", "U-alice", "ข้าว 50").status_code == 200
+
+    body, headers = _signed_body(
+        {"events": [_text_event("evt-edit-idem", "U-alice", "แก้ ข้าวมันไก่ 120")]}
+    )
+    original_reply = app_module.reply_text
+    attempted_responses = []
+
+    async def fail_edit_reply(reply_token, response_text, token):
+        attempted_responses.append(response_text)
+        raise LineTransportError("simulated edit reply failure")
+
+    monkeypatch.setattr(app_module, "reply_text", fail_edit_reply)
+    assert client.post("/webhook", content=body, headers=headers).status_code == 502
+    monkeypatch.setattr(app_module, "reply_text", original_reply)
+
+    assert _post_text(client, "evt-new-latest", "U-alice", "BTS 47").status_code == 200
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    assert replies[-1][1] == attempted_responses[0]
+    reply_count = len(replies)
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    assert len(replies) == reply_count
+
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [(item.description, item.amount_satang) for item in items] == [
+            ("ข้าวมันไก่", 12000),
+            ("BTS", 4700),
+        ]
+        event = session.get(ProcessedWebhookEvent, "evt-edit-idem")
+        assert event is not None
+        assert event.response_text == attempted_responses[0]
+        assert event.reply_sent is True
+        assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 3
+    assert [reply[0] for reply in replies].count("reply-evt-edit-idem") == 1
+
+
 def test_conflict_preserves_pending_state_until_valid_followup(webhook_client):
     client, engine, replies = webhook_client
     assert _post_text(client, "evt-draft", "U-alice", "ข้าว").status_code == 200

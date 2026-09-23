@@ -35,6 +35,7 @@ class CommandKind(str, Enum):
     RECENT = "recent"
     MONTHLY_SUMMARY = "monthly_summary"
     DELETE_LATEST = "delete_latest"
+    EDIT_LATEST = "edit_latest"
     SET_SAVINGS_GOAL = "set_savings_goal"
     ADD_SAVINGS = "add_savings"
     SAVINGS_STATUS = "savings_status"
@@ -49,6 +50,18 @@ class TransactionCommand:
     category: str
     transaction_date: date
     description: str
+    inference_rule: str
+
+
+@dataclass(frozen=True)
+class EditLatestCommand:
+    kind: CommandKind
+    transaction_type: TransactionType
+    amount: Decimal
+    category: str
+    description: str
+    transaction_date: date
+    explicit_occurred_on: bool
     inference_rule: str
 
 
@@ -77,6 +90,11 @@ class UnresolvedCommand:
 
 
 @dataclass(frozen=True)
+class UnresolvedEditCommand(UnresolvedCommand):
+    """An edit-prefixed command that cannot safely replace a transaction."""
+
+
+@dataclass(frozen=True)
 class IncompleteCommand:
     transaction_type: TransactionType | None
     amount: Decimal | None
@@ -88,6 +106,7 @@ class IncompleteCommand:
 
 ParsedCommand: TypeAlias = (
     TransactionCommand
+    | EditLatestCommand
     | IncompleteCommand
     | SimpleCommand
     | SavingsGoalCommand
@@ -132,6 +151,10 @@ _FUTURE_TRANSACTION_PATTERNS = (
 _CLAUSE_NEGATED_ACTION_PATTERN = (
     rf"{_TRANSACTION_SIGNAL_PATTERN}.+(?:ยัง)?(?:ไม่ได้|ไม่ออก)"
 )
+
+# Phase 1C edit prefixes demand whitespace so ordinary items such as "แก้ว 60"
+# or "แก้ข้าว 60" are never reinterpreted as edits. "แก้ไข " is matched first.
+_EDIT_PREFIX_PATTERN = re.compile(r"^(แก้ไข|แก้)\s+")
 
 
 def _local_date(now: datetime | date | None) -> date:
@@ -356,10 +379,63 @@ def _unresolved(reason: str, *, ambiguous: bool = True) -> UnresolvedCommand:
     )
 
 
+def _unresolved_edit(reason: str) -> UnresolvedEditCommand:
+    return UnresolvedEditCommand(CommandKind.AMBIGUOUS, reason)
+
+
 FOLLOWUP_CONFLICT_REASON = "ข้อมูลนี้ขัดกับรายการที่ค้างไว้ครับ กรุณาส่งข้อมูลที่ขาด หรือพิมพ์ \"ยกเลิก\""
+
+EDIT_MISSING_DETAILS_REASON = "กรุณาระบุข้อมูลใหม่หลังคำว่า \"แก้ไข\" ครับ"
+EDIT_INCOMPLETE_REASON = "คำสั่งแก้ไขต้องระบุรายการและจำนวนเงินให้ครบในข้อความเดียวครับ"
 
 
 def parse_command(text: str, now: datetime | date | None = None) -> ParsedCommand:
+    """Parse one Thai chat message into a typed command.
+
+    Edit prefixes (``แก้ `` / ``แก้ไข ``) are intercepted here and parsed with the
+    bounded ``_parse_command_core`` helper so edit parsing never recurses into
+    itself.  ``now`` may be a date or datetime for deterministic callers/tests.
+    Aware datetimes are converted to Asia/Bangkok; naive datetimes are
+    interpreted as Bangkok local time.
+    """
+
+    edit_text = text.lstrip()
+    if _EDIT_PREFIX_PATTERN.match(edit_text):
+        return _parse_edit_command(edit_text, now)
+    return _parse_command_core(text, now)
+
+
+def _parse_edit_command(text: str, now: datetime | date | None) -> ParsedCommand:
+    """Build an ``EditLatestCommand`` from a validated edit prefix."""
+
+    match = _EDIT_PREFIX_PATTERN.match(text)
+    assert match is not None
+    remainder = text[match.end() :].strip()
+    if not remainder:
+        return _unresolved_edit(EDIT_MISSING_DETAILS_REASON)
+
+    evidence = _parse_command_core(remainder, now)
+    if isinstance(evidence, UnresolvedCommand):
+        return _unresolved_edit(evidence.reason)
+    if not isinstance(evidence, TransactionCommand):
+        return _unresolved_edit(EDIT_INCOMPLETE_REASON)
+
+    transaction_type: TransactionType = (
+        "income" if evidence.kind == CommandKind.INCOME else "expense"
+    )
+    return EditLatestCommand(
+        CommandKind.EDIT_LATEST,
+        transaction_type,
+        evidence.amount,
+        evidence.category,
+        evidence.description,
+        evidence.transaction_date,
+        _has_explicit_date(remainder),
+        evidence.inference_rule,
+    )
+
+
+def _parse_command_core(text: str, now: datetime | date | None = None) -> ParsedCommand:
     """Parse one Thai chat message into a typed command.
 
     ``now`` may be a date or datetime for deterministic callers/tests. Aware
@@ -550,7 +626,10 @@ def parse_followup(
     """Safety-check and merge structured evidence into an incomplete transaction."""
 
     evidence = parse_command(text, now=now)
-    if isinstance(evidence, (SimpleCommand, SavingsGoalCommand, SavingsProgressCommand)):
+    if isinstance(
+        evidence,
+        (SimpleCommand, SavingsGoalCommand, SavingsProgressCommand, EditLatestCommand),
+    ):
         return _unresolved("ยังไม่มีข้อมูลธุรกรรมที่ใช้เติมรายการ")
     if isinstance(evidence, UnresolvedCommand):
         return evidence
@@ -643,6 +722,9 @@ def parse_followup(
 
 __all__ = [
     "CommandKind",
+    "EDIT_INCOMPLETE_REASON",
+    "EDIT_MISSING_DETAILS_REASON",
+    "EditLatestCommand",
     "FOLLOWUP_CONFLICT_REASON",
     "IncompleteCommand",
     "ParsedCommand",
@@ -651,6 +733,7 @@ __all__ = [
     "SimpleCommand",
     "TransactionCommand",
     "UnresolvedCommand",
+    "UnresolvedEditCommand",
     "parse_command",
     "parse_followup",
 ]

@@ -24,6 +24,7 @@ from repository import (
     monthly_summary,
     set_savings_goal,
     set_webhook_response,
+    update_latest_transaction,
     update_pending_transaction,
 )
 
@@ -91,6 +92,136 @@ def test_recent_delete_and_monthly_summary(db_session):
     assert deleted.amount == Decimal("999")
     assert delete_latest_transaction("U-bob", session=db_session) is None
     assert len(list_recent_transactions("U-alice", session=db_session)) == 3
+
+
+def test_update_latest_transaction_replaces_only_the_newest_row(db_session):
+    older = add_transaction(
+        "U-alice",
+        "expense",
+        "50",
+        "อาหาร",
+        description="ข้าว",
+        occurred_on=date(2026, 9, 1),
+        session=db_session,
+    )
+    newer = add_transaction(
+        "U-alice",
+        "expense",
+        "80",
+        "เดินทาง",
+        description="BTS",
+        occurred_on=date(2026, 9, 2),
+        session=db_session,
+    )
+
+    updated = update_latest_transaction(
+        "U-alice",
+        "income",
+        "999",
+        "ค่าขนม",
+        description="แม่ให้",
+        occurred_on=date(2026, 9, 3),
+        session=db_session,
+    )
+
+    assert updated is not None
+    assert updated.id == newer.id
+    assert updated.transaction_type == "income"
+    assert updated.amount == Decimal("999")
+    assert updated.category == "ค่าขนม"
+    assert updated.description == "แม่ให้"
+    assert updated.occurred_on == date(2026, 9, 3)
+
+    assert older.transaction_type == "expense"
+    assert older.amount == Decimal("50")
+    assert older.occurred_on == date(2026, 9, 1)
+
+
+def test_update_latest_transaction_inherits_date_when_none(db_session):
+    add_transaction(
+        "U-alice",
+        "expense",
+        "50",
+        "อาหาร",
+        description="ข้าว",
+        occurred_on=date(2026, 9, 1),
+        session=db_session,
+    )
+
+    updated = update_latest_transaction(
+        "U-alice", "expense", "60", "อาหาร", session=db_session
+    )
+
+    assert updated is not None
+    assert updated.occurred_on == date(2026, 9, 1)
+    assert updated.description is None
+
+
+def test_update_latest_transaction_is_isolated_and_handles_no_rows(db_session):
+    add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+    add_transaction("U-bob", "income", "500", "ค่าขนม", session=db_session)
+
+    assert (
+        update_latest_transaction(
+            "U-carol", "expense", "10", "อื่นๆ", session=db_session
+        )
+        is None
+    )
+
+    update_latest_transaction("U-bob", "expense", "20", "อื่นๆ", session=db_session)
+
+    alice_items = list_recent_transactions("U-alice", session=db_session)
+    bob_items = list_recent_transactions("U-bob", session=db_session)
+    assert [(item.transaction_type, item.amount) for item in alice_items] == [
+        ("expense", Decimal("50"))
+    ]
+    assert [(item.transaction_type, item.amount) for item in bob_items] == [
+        ("expense", Decimal("20"))
+    ]
+
+
+def test_update_latest_transaction_uses_created_at_then_id(db_session):
+    earlier_created = add_transaction(
+        "U-alice",
+        "expense",
+        "10",
+        "อื่นๆ",
+        occurred_on=date(2026, 12, 31),
+        session=db_session,
+    )
+    later_created = add_transaction(
+        "U-alice",
+        "expense",
+        "20",
+        "อื่นๆ",
+        occurred_on=date(2026, 1, 1),
+        session=db_session,
+    )
+    earlier_created.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    later_created.created_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    db_session.flush()
+
+    updated = update_latest_transaction(
+        "U-alice", "income", "30", "ค่าขนม", session=db_session
+    )
+
+    assert updated is not None
+    assert updated.id == later_created.id
+    assert earlier_created.amount == Decimal("10")
+
+    tied_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
+    earlier_created.created_at = tied_at
+    later_created.created_at = tied_at
+    db_session.flush()
+
+    updated = update_latest_transaction(
+        "U-alice", "expense", "40", "อาหาร", session=db_session
+    )
+
+    assert updated is not None
+    assert updated.id == later_created.id
+    assert later_created.id > earlier_created.id
+    assert earlier_created.amount == Decimal("10")
 
 
 def test_savings_goal_is_isolated_and_keeps_progress_when_updated(db_session):
