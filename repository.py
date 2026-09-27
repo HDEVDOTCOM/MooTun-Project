@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from calendar import monthrange
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any
 from uuid import uuid4
 
@@ -20,15 +22,38 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import init_db, session_scope
-from models import PendingTransaction, ProcessedWebhookEvent, SavingsGoal, Transaction
+from models import (
+    PendingAction,
+    PendingTransaction,
+    ProcessedWebhookEvent,
+    SavingsGoal,
+    Transaction,
+)
 
 
 MoneyInput = Decimal | int | str
 PENDING_TRANSACTION_TTL = timedelta(hours=1)
+PENDING_ACTION_TTL = timedelta(minutes=10)
 
 
 class PendingTransactionConflictError(RuntimeError):
     """A pending draft changed while the current operation was in progress."""
+
+
+class PendingActionConflictError(RuntimeError):
+    """A pending action changed while the current operation was in progress."""
+
+
+class PendingActionState(str, Enum):
+    ACTIVE = "active"
+    EXPIRED_CLEANED = "expired_cleaned"
+    ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class PendingActionResult:
+    state: PendingActionState
+    action: PendingAction | None = None
 
 
 def baht_to_satang(amount: MoneyInput) -> int:
@@ -449,6 +474,192 @@ def delete_pending_transaction(
         )
         db.flush()
         return result.rowcount == 1
+
+
+def get_pending_action(
+    line_user_id: str,
+    *,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> PendingActionResult:
+    """Read active action state without collapsing cleaned expiry into absence."""
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+
+    with _session_context(session) as db:
+        action = db.get(PendingAction, user_id)
+        if action is None:
+            return PendingActionResult(PendingActionState.ABSENT)
+        expires_at = action.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at > current_time:
+            return PendingActionResult(PendingActionState.ACTIVE, action)
+
+        result = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == action.action_id,
+                PendingAction.version == action.version,
+                PendingAction.expires_at <= action.expires_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        if result.rowcount == 0:
+            raise PendingActionConflictError(
+                "pending action changed during expiry cleanup"
+            )
+        return PendingActionResult(PendingActionState.EXPIRED_CLEANED)
+
+
+def create_pending_action(
+    line_user_id: str,
+    *,
+    action_type: str,
+    target_transaction_id: int,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    """Create one pending action; first successful concurrent create wins."""
+
+    user_id = _validate_user_id(line_user_id)
+    if action_type != "confirm_delete":
+        raise ValueError("action_type must be 'confirm_delete'")
+    if target_transaction_id < 1:
+        raise ValueError("target_transaction_id must be positive")
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    values = {
+        "line_user_id": user_id,
+        "action_id": uuid4().hex,
+        "version": 1,
+        "action_type": action_type,
+        "target_transaction_id": target_transaction_id,
+        "created_at": current_time,
+        "expires_at": current_time + PENDING_ACTION_TTL,
+    }
+    with _session_context(session) as db:
+        try:
+            with db.begin_nested():
+                db.execute(insert(PendingAction).values(**values))
+                db.flush()
+        except IntegrityError:
+            return False
+        return True
+
+
+def delete_pending_action(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    """Delete the exact active action using identity and version OCC guards."""
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        return result.rowcount == 1
+
+
+def invalidate_pending_action(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    return delete_pending_action(
+        line_user_id,
+        expected_version,
+        expected_action_id=expected_action_id,
+        now=now,
+        session=session,
+    )
+
+
+def confirm_delete_transaction(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    target_transaction_id: int,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> Transaction | None:
+    """Consume an exact confirmation and delete its user-scoped target."""
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+
+    with _session_context(session) as db:
+        result = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "confirm_delete",
+                PendingAction.target_transaction_id == target_transaction_id,
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        if result.rowcount == 0:
+            raise PendingActionConflictError(
+                "pending action changed during confirmation"
+            )
+
+        item = db.scalar(
+            select(Transaction).where(
+                Transaction.id == target_transaction_id,
+                Transaction.line_user_id == user_id,
+            )
+        )
+        if item is None:
+            return None
+        db.delete(item)
+        db.flush()
+        return item
+
+
+def get_latest_transaction(
+    line_user_id: str, *, session: Session | None = None
+) -> Transaction | None:
+    user_id = _validate_user_id(line_user_id)
+    statement = (
+        select(Transaction)
+        .where(Transaction.line_user_id == user_id)
+        .order_by(Transaction.created_at.desc(), Transaction.id.desc())
+        .limit(1)
+    )
+    with _session_context(session) as db:
+        return db.scalar(statement)
 
 
 def mark_webhook_processed(

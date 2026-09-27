@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 import app as app_module
 from database import configure_database
 from line_api import LineTransportError
-from models import PendingTransaction, ProcessedWebhookEvent, Transaction
+from models import PendingAction, PendingTransaction, ProcessedWebhookEvent, Transaction
 
 
 SECRET = "test-channel-secret"
@@ -58,6 +58,10 @@ def _post_text(
         {"events": [_text_event(event_id, user_id, text, timestamp=timestamp)]}
     )
     return client.post("/webhook", content=body, headers=headers)
+
+
+def _row_state(item):
+    return tuple(getattr(item, column.name) for column in item.__table__.columns)
 
 
 @pytest.fixture()
@@ -475,6 +479,459 @@ def test_edit_latest_redelivery_does_not_edit_intervening_latest(
         assert event.reply_sent is True
         assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 3
     assert [reply[0] for reply in replies].count("reply-evt-edit-idem") == 1
+
+
+def test_active_delete_confirmation_cancel_preserves_pending_draft(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-delete-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-delete-request", "U-alice", "ลบล่าสุด").status_code == 200
+    assert "ยืนยันลบรายการนี้หรือไม่" in replies[-1][1]
+    assert _post_text(client, "evt-delete-draft", "U-alice", "กาแฟ").status_code == 200
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        pending_state = _row_state(pending)
+
+    assert _post_text(client, "evt-delete-cancel", "U-alice", "ยกเลิก").status_code == 200
+    assert replies[-1][1] == "ยกเลิกการลบแล้ว"
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        assert _row_state(pending) == pending_state
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+
+
+@pytest.mark.parametrize("control", ["ยกเลิก", "ยืนยัน"])
+def test_expired_delete_control_preserves_transaction_and_draft(
+    webhook_client,
+    control,
+):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-expired-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-expired-request", "U-alice", "ลบล่าสุด").status_code == 200
+    assert _post_text(client, "evt-expired-draft", "U-alice", "กาแฟ").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        pending = session.get(PendingTransaction, "U-alice")
+        transaction = session.scalar(select(Transaction))
+        assert action is not None
+        assert pending is not None
+        assert transaction is not None
+        action.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        pending_state = _row_state(pending)
+        transaction_state = _row_state(transaction)
+        session.commit()
+
+    assert _post_text(
+        client,
+        f"evt-expired-{control}",
+        "U-alice",
+        control,
+    ).status_code == 200
+    assert replies[-1][1] == (
+        "คำสั่งลบหมดอายุแล้ว กรุณาส่ง 'ลบล่าสุด' อีกครั้งหากต้องการลบ"
+    )
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        transaction = session.scalar(select(Transaction))
+        assert pending is not None
+        assert transaction is not None
+        assert _row_state(pending) == pending_state
+        assert _row_state(transaction) == transaction_state
+        assert session.get(PendingAction, "U-alice") is None
+
+
+def test_confirm_without_pending_action_preserves_unknown_behavior(webhook_client):
+    client, engine, replies = webhook_client
+
+    assert _post_text(client, "evt-confirm-absent", "U-alice", "ยืนยัน").status_code == 200
+
+    assert replies[-1][1].startswith("ยังไม่เข้าใจข้อความนี้")
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_delete_confirmation_deletes_bound_target_only(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-bound-seed-1", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-bound-seed-2", "U-alice", "BTS 47").status_code == 200
+    assert _post_text(client, "evt-bound-request", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        bound_target_id = action.target_transaction_id
+        newer = Transaction(
+            line_user_id="U-alice",
+            transaction_type="income",
+            amount_satang=50000,
+            category="ค่าขนม",
+            description="แม่ให้",
+            occurred_on=date(2026, 9, 23),
+            created_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        session.add(newer)
+        session.commit()
+        newer_id = newer.id
+
+    assert _post_text(client, "evt-bound-confirm", "U-alice", "ยืนยัน").status_code == 200
+    assert "ลบรายการเรียบร้อยแล้ว" in replies[-1][1]
+    with Session(engine) as session:
+        assert session.get(Transaction, bound_target_id) is None
+        assert session.get(Transaction, newer_id) is not None
+        assert session.scalar(select(func.count(Transaction.id))) == 2
+        assert session.get(PendingAction, "U-alice") is None
+
+
+def test_delete_confirmation_is_user_isolated(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-isolate-a", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-isolate-b", "U-bob", "เงินเดือน 20000").status_code == 200
+    assert _post_text(client, "evt-isolate-request", "U-alice", "ลบล่าสุด").status_code == 200
+
+    assert _post_text(client, "evt-isolate-b-confirm", "U-bob", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("ยังไม่เข้าใจข้อความนี้")
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 2
+
+    assert _post_text(client, "evt-isolate-a-confirm", "U-alice", "ยืนยัน").status_code == 200
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction)))
+        assert [(item.line_user_id, item.description) for item in items] == [
+            ("U-bob", "เงินเดือน")
+        ]
+
+
+def test_repeated_delete_replaces_action_with_current_latest(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-repeat-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-repeat-first", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        first_action = session.get(PendingAction, "U-alice")
+        assert first_action is not None
+        first_action_id = first_action.action_id
+        first_target_id = first_action.target_transaction_id
+        newer = Transaction(
+            line_user_id="U-alice",
+            transaction_type="expense",
+            amount_satang=4700,
+            category="เดินทาง",
+            description="BTS",
+            occurred_on=date(2026, 9, 23),
+            created_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        session.add(newer)
+        session.commit()
+        newer_id = newer.id
+
+    assert _post_text(client, "evt-repeat-second", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        replacement = session.get(PendingAction, "U-alice")
+        assert replacement is not None
+        assert replacement.action_id != first_action_id
+        assert replacement.target_transaction_id == newer_id
+        assert replacement.target_transaction_id != first_target_id
+        assert session.scalar(select(func.count(Transaction.id))) == 2
+
+
+def test_repeated_delete_with_missing_only_target_leaves_no_action(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-empty-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-empty-first", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        session.execute(delete(Transaction).where(Transaction.id == action.target_transaction_id))
+        session.commit()
+
+    assert _post_text(client, "evt-empty-second", "U-alice", "ลบล่าสุด").status_code == 200
+    assert replies[-1][1] == "ยังไม่มีรายการให้ลบ"
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_descriptions"),
+    [
+        ("BTS 47", ["ข้าว", "BTS"]),
+        ("แก้ ข้าว 60", ["ข้าว"]),
+    ],
+)
+def test_transaction_mutation_invalidates_delete_confirmation(
+    webhook_client,
+    mutation,
+    expected_descriptions,
+):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-invalidate-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-invalidate-request", "U-alice", "ลบล่าสุด").status_code == 200
+
+    assert _post_text(client, "evt-invalidate-mutation", "U-alice", mutation).status_code == 200
+
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [item.description for item in items] == expected_descriptions
+        if mutation.startswith("แก้"):
+            assert items[0].amount_satang == 6000
+
+
+def test_pending_completion_invalidates_delete_confirmation(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-complete-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-complete-request", "U-alice", "ลบล่าสุด").status_code == 200
+    assert _post_text(client, "evt-complete-draft", "U-alice", "กาแฟ").status_code == 200
+
+    assert _post_text(client, "evt-complete-amount", "U-alice", "50").status_code == 200
+
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.get(PendingTransaction, "U-alice") is None
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [(item.description, item.amount_satang) for item in items] == [
+            ("ข้าว", 4000),
+            ("กาแฟ", 5000),
+        ]
+
+
+def test_stateless_commands_preserve_delete_confirmation(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-stateless-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-stateless-request", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        original_state = _row_state(action)
+
+    for index, command in enumerate(
+        ("ช่วยเหลือ", "รายการล่าสุด", "สรุปเดือนนี้", "เป้าหมายการออม")
+    ):
+        assert _post_text(
+            client,
+            f"evt-stateless-{index}",
+            "U-alice",
+            command,
+        ).status_code == 200
+        with Session(engine) as session:
+            action = session.get(PendingAction, "U-alice")
+            assert action is not None
+            assert _row_state(action) == original_state
+
+
+def test_missing_delete_target_consumes_action_and_preserves_draft(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-missing-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-missing-request", "U-alice", "ลบล่าสุด").status_code == 200
+    assert _post_text(client, "evt-missing-draft", "U-alice", "กาแฟ").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        pending = session.get(PendingTransaction, "U-alice")
+        assert action is not None
+        assert pending is not None
+        pending_state = _row_state(pending)
+        session.execute(delete(Transaction).where(Transaction.id == action.target_transaction_id))
+        session.commit()
+
+    assert _post_text(client, "evt-missing-confirm", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1] == "ไม่พบรายการที่ต้องการลบ (อาจถูกลบไปแล้ว)"
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        assert _row_state(pending) == pending_state
+        assert session.get(PendingAction, "U-alice") is None
+
+
+def test_pending_action_invalidation_occ_loser_is_cached(webhook_client, monkeypatch):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-occ-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-occ-request", "U-alice", "ลบล่าสุด").status_code == 200
+    calls = 0
+
+    def lose_invalidation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(app_module, "invalidate_pending_action", lose_invalidation)
+    body, headers = _signed_body(
+        {"events": [_text_event("evt-action-occ-loser", "U-alice", "แก้ ข้าว 60")]}
+    )
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    loser_reply = replies[-1][1]
+    assert loser_reply == "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert calls == 1
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    assert calls == 1
+    with Session(engine) as session:
+        item = session.scalar(select(Transaction))
+        action = session.get(PendingAction, "U-alice")
+        event = session.get(ProcessedWebhookEvent, "evt-action-occ-loser")
+        assert item is not None
+        assert item.amount_satang == 4000
+        assert action is not None
+        assert event is not None
+        assert event.response_text == loser_reply
+        assert event.reply_sent is True
+
+
+@pytest.mark.parametrize("control", ["ยกเลิก", "ยืนยัน"])
+def test_pending_action_lazy_expiry_occ_loser_is_cached_and_not_reinterpreted(
+    webhook_client,
+    monkeypatch,
+    control,
+):
+    client, engine, _ = webhook_client
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    replacement_expiry = now + timedelta(minutes=10)
+    old_action_id = "a" * 32
+    replacement_action_id = "b" * 32
+    with Session(engine) as session:
+        target = Transaction(
+            line_user_id="U-alice",
+            transaction_type="expense",
+            amount_satang=4000,
+            category="อาหาร",
+            description="ข้าว",
+            occurred_on=now.date(),
+            created_at=now,
+        )
+        session.add(target)
+        session.flush()
+        session.add_all(
+            [
+                PendingAction(
+                    line_user_id="U-alice",
+                    action_id=old_action_id,
+                    version=1,
+                    action_type="confirm_delete",
+                    target_transaction_id=target.id,
+                    created_at=now - timedelta(minutes=20),
+                    expires_at=now - timedelta(minutes=10),
+                ),
+                PendingTransaction(
+                    line_user_id="U-alice",
+                    draft_id="c" * 32,
+                    version=3,
+                    transaction_type="expense",
+                    amount_satang=None,
+                    category="อาหาร",
+                    description="กาแฟ",
+                    inference_rule="expense.food",
+                    occurred_on=now.date(),
+                    created_at=now,
+                    expires_at=now + timedelta(hours=1),
+                ),
+            ]
+        )
+        session.commit()
+        target_id = target.id
+
+    original_execute = Session.execute
+    replaced = False
+
+    def replace_before_cleanup(session, statement, *args, **kwargs):
+        nonlocal replaced
+        is_action_delete = (
+            getattr(statement, "is_delete", False)
+            and statement.table.name == "pending_actions"
+        )
+        if is_action_delete and not replaced:
+            replaced = True
+            original_execute(
+                session,
+                delete(PendingAction)
+                .where(PendingAction.line_user_id == "U-alice")
+                .execution_options(synchronize_session=False),
+            )
+            original_execute(
+                session,
+                insert(PendingAction).values(
+                    line_user_id="U-alice",
+                    action_id=replacement_action_id,
+                    version=7,
+                    action_type="confirm_delete",
+                    target_transaction_id=target_id,
+                    created_at=now,
+                    expires_at=replacement_expiry,
+                ),
+            )
+        return original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_utc_now", lambda: now)
+    monkeypatch.setattr(Session, "execute", replace_before_cleanup)
+    attempts = []
+
+    async def fail_first_reply(reply_token, response_text, token):
+        attempts.append(response_text)
+        if len(attempts) == 1:
+            raise LineTransportError("simulated reply failure")
+
+    monkeypatch.setattr(app_module, "reply_text", fail_first_reply)
+    assert _post_text(client, "evt-action-expiry-loser", "U-alice", control).status_code == 502
+    retry_reply = "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert attempts == [retry_reply]
+
+    with Session(engine) as session:
+        replacement = session.get(PendingAction, "U-alice")
+        pending = session.get(PendingTransaction, "U-alice")
+        event = session.get(ProcessedWebhookEvent, "evt-action-expiry-loser")
+        assert replacement is not None
+        assert replacement.action_id == replacement_action_id
+        assert replacement.version == 7
+        assert pending is not None
+        assert pending.draft_id == "c" * 32
+        assert pending.version == 3
+        assert session.get(Transaction, target_id) is not None
+        assert event is not None
+        assert event.response_text == retry_reply
+        assert event.reply_sent is False
+
+    assert _post_text(client, "evt-action-expiry-loser", "U-alice", control).status_code == 200
+    assert attempts == [retry_reply, retry_reply]
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice").action_id == replacement_action_id
+        assert session.get(PendingTransaction, "U-alice").draft_id == "c" * 32
+        assert session.get(Transaction, target_id) is not None
+        assert session.get(ProcessedWebhookEvent, "evt-action-expiry-loser").reply_sent is True
+
+
+def test_delete_confirm_cancel_webhook_redelivery_is_idempotent(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-idem-seed", "U-alice", "ข้าว 40").status_code == 200
+
+    delete_body, delete_headers = _signed_body(
+        {"events": [_text_event("evt-idem-delete", "U-alice", "ลบล่าสุด")]}
+    )
+    assert client.post("/webhook", content=delete_body, headers=delete_headers).status_code == 200
+    with Session(engine) as session:
+        first_action_id = session.get(PendingAction, "U-alice").action_id
+    assert client.post("/webhook", content=delete_body, headers=delete_headers).status_code == 200
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice").action_id == first_action_id
+    assert [reply[0] for reply in replies].count("reply-evt-idem-delete") == 1
+
+    cancel_body, cancel_headers = _signed_body(
+        {"events": [_text_event("evt-idem-cancel", "U-alice", "ยกเลิก")]}
+    )
+    assert client.post("/webhook", content=cancel_body, headers=cancel_headers).status_code == 200
+    assert client.post("/webhook", content=cancel_body, headers=cancel_headers).status_code == 200
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+    assert [reply[0] for reply in replies].count("reply-evt-idem-cancel") == 1
+
+    assert _post_text(client, "evt-idem-delete-2", "U-alice", "ลบล่าสุด").status_code == 200
+    confirm_body, confirm_headers = _signed_body(
+        {"events": [_text_event("evt-idem-confirm", "U-alice", "ยืนยัน")]}
+    )
+    assert client.post("/webhook", content=confirm_body, headers=confirm_headers).status_code == 200
+    assert client.post("/webhook", content=confirm_body, headers=confirm_headers).status_code == 200
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        assert session.get(PendingAction, "U-alice") is None
+    assert [reply[0] for reply in replies].count("reply-evt-idem-confirm") == 1
 
 
 def test_conflict_preserves_pending_state_until_valid_followup(webhook_client):

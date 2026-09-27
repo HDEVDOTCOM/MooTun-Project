@@ -2,6 +2,7 @@ from datetime import date
 
 from messages import (
     format_amount,
+    format_delete_confirmation_prompt,
     format_edit_confirmation,
     format_help_message,
     format_monthly_summary,
@@ -53,6 +54,25 @@ def test_edit_confirmation_contains_clean_transaction_fields() -> None:
     assert "หมวด: เงินเดือน" in message
     assert "วันที่: 14/09/2569" in message
     assert "รายการ:" not in message
+
+
+def test_delete_confirmation_prompt_identifies_exact_target() -> None:
+    message = format_delete_confirmation_prompt(
+        {
+            "type": "expense",
+            "amount": "60",
+            "category": "อาหาร",
+            "date": date(2026, 9, 21),
+            "note": "ข้าว",
+        }
+    )
+
+    assert "ประเภท: รายจ่าย" in message
+    assert "รายการ: ข้าว" in message
+    assert "จำนวน: 60 บาท" in message
+    assert "หมวด: อาหาร" in message
+    assert "วันที่: 21/09/2569" in message
+    assert 'พิมพ์ "ยืนยัน"' in message
 
 
 def test_recent_transactions_handles_empty_and_mixed_items() -> None:

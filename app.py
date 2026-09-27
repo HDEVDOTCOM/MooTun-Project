@@ -18,6 +18,7 @@ from line_api import LineAPIError, reply_text, verify_webhook_signature
 from messages import (
     format_buddhist_date,
     format_buddhist_month,
+    format_delete_confirmation_prompt,
     format_edit_confirmation,
     format_help_message,
     format_monthly_summary,
@@ -44,12 +45,18 @@ from parser import (
     parse_followup,
 )
 from repository import (
+    PendingActionConflictError,
+    PendingActionState,
     PendingTransactionConflictError,
     add_savings_progress,
     add_transaction,
+    confirm_delete_transaction,
+    create_pending_action,
     create_pending_transaction,
+    delete_pending_action,
     delete_pending_transaction,
-    delete_latest_transaction,
+    get_latest_transaction,
+    get_pending_action,
     get_savings_goal,
     get_pending_transaction,
     get_webhook_event,
@@ -59,6 +66,7 @@ from repository import (
     monthly_summary,
     set_savings_goal,
     set_webhook_response,
+    invalidate_pending_action,
     update_latest_transaction,
     update_pending_transaction,
 )
@@ -66,6 +74,8 @@ from repository import (
 
 logger = logging.getLogger("mootoon")
 BANGKOK = ZoneInfo("Asia/Bangkok")
+PENDING_ACTION_RETRY_REPLY = "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+PENDING_ACTION_EXPIRED_REPLY = "คำสั่งลบหมดอายุแล้ว กรุณาส่ง 'ลบล่าสุด' อีกครั้งหากต้องการลบ"
 
 load_dotenv()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -139,6 +149,55 @@ def handle_text_message(
     """Run one verified user's command and return a Thai LINE reply."""
 
     processing_time = _utc_now()
+    normalized_text = text.strip().lower()
+
+    try:
+        action_result = get_pending_action(
+            line_user_id,
+            now=processing_time,
+            session=session,
+        )
+    except PendingActionConflictError:
+        return PENDING_ACTION_RETRY_REPLY
+
+    if (
+        action_result.state == PendingActionState.EXPIRED_CLEANED
+        and normalized_text in {"ยืนยัน", "ยกเลิก"}
+    ):
+        return PENDING_ACTION_EXPIRED_REPLY
+
+    action = action_result.action
+    if action is not None and action.action_type == "confirm_delete":
+        if normalized_text == "ยืนยัน":
+            try:
+                item = confirm_delete_transaction(
+                    line_user_id,
+                    action.version,
+                    expected_action_id=action.action_id,
+                    target_transaction_id=action.target_transaction_id,
+                    now=_utc_now(),
+                    session=session,
+                )
+            except PendingActionConflictError:
+                return PENDING_ACTION_RETRY_REPLY
+            if item is None:
+                return "ไม่พบรายการที่ต้องการลบ (อาจถูกลบไปแล้ว)"
+            return (
+                "🗑️ ลบรายการเรียบร้อยแล้ว\n"
+                f"{item.category} · {item.amount:,.2f} บาท · "
+                f"{format_buddhist_date(item.occurred_on)}"
+            ).replace(".00 บาท", " บาท")
+        if normalized_text == "ยกเลิก":
+            if not delete_pending_action(
+                line_user_id,
+                action.version,
+                expected_action_id=action.action_id,
+                now=_utc_now(),
+                session=session,
+            ):
+                return PENDING_ACTION_RETRY_REPLY
+            return "ยกเลิกการลบแล้ว"
+
     try:
         pending = get_pending_transaction(
             line_user_id,
@@ -147,7 +206,7 @@ def handle_text_message(
         )
     except PendingTransactionConflictError:
         return "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
-    if pending is not None and text.strip().lower() == "ยกเลิก":
+    if pending is not None and normalized_text == "ยกเลิก":
         if not delete_pending_transaction(
             line_user_id,
             pending.version,
@@ -164,6 +223,14 @@ def handle_text_message(
         return format_unknown_message(command.reason)
 
     if isinstance(command, EditLatestCommand):
+        if action is not None and not invalidate_pending_action(
+            line_user_id,
+            action.version,
+            expected_action_id=action.action_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
         item = update_latest_transaction(
             line_user_id,
             command.transaction_type,
@@ -184,6 +251,16 @@ def handle_text_message(
         return format_edit_confirmation(_transaction_data(item))
 
     if pending is not None and isinstance(command, TransactionCommand):
+        if action is not None:
+            if not invalidate_pending_action(
+                line_user_id,
+                action.version,
+                expected_action_id=action.action_id,
+                now=_utc_now(),
+                session=session,
+            ):
+                return PENDING_ACTION_RETRY_REPLY
+            action = None
         if not delete_pending_transaction(
             line_user_id,
             pending.version,
@@ -207,6 +284,16 @@ def handle_text_message(
         )
         followup = parse_followup(draft, text, now=event_time)
         if isinstance(followup, TransactionCommand):
+            if action is not None:
+                if not invalidate_pending_action(
+                    line_user_id,
+                    action.version,
+                    expected_action_id=action.action_id,
+                    now=_utc_now(),
+                    session=session,
+                ):
+                    return PENDING_ACTION_RETRY_REPLY
+                action = None
             if not delete_pending_transaction(
                 line_user_id,
                 pending.version,
@@ -258,6 +345,14 @@ def handle_text_message(
         )
 
     if isinstance(command, TransactionCommand):
+        if action is not None and not invalidate_pending_action(
+            line_user_id,
+            action.version,
+            expected_action_id=action.action_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
         item = add_transaction(
             line_user_id,
             command.kind.value,
@@ -305,14 +400,26 @@ def handle_text_message(
         return format_recent_transactions([_transaction_data(item) for item in items])
 
     if command.kind == CommandKind.DELETE_LATEST:
-        item = delete_latest_transaction(line_user_id, session=session)
+        if action is not None and not invalidate_pending_action(
+            line_user_id,
+            action.version,
+            expected_action_id=action.action_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
+        item = get_latest_transaction(line_user_id, session=session)
         if item is None:
             return "ยังไม่มีรายการให้ลบ"
-        return (
-            "🗑️ ลบรายการล่าสุดแล้ว\n"
-            f"{item.category} · {item.amount:,.2f} บาท · "
-            f"{format_buddhist_date(item.occurred_on)}"
-        ).replace(".00 บาท", " บาท")
+        if not create_pending_action(
+            line_user_id,
+            action_type="confirm_delete",
+            target_transaction_id=item.id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
+        return format_delete_confirmation_prompt(_transaction_data(item))
 
     if command.kind == CommandKind.MONTHLY_SUMMARY:
         local = event_time.astimezone(BANGKOK)

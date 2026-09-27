@@ -2,21 +2,29 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine, inspect, text, update
+from sqlalchemy import create_engine, delete, inspect, insert, select, text, update
 from sqlalchemy.orm import Session
 
-from models import Base, PendingTransaction
+from models import Base, PendingAction, PendingTransaction, Transaction
 from database import init_db
 from repository import (
+    PENDING_ACTION_TTL,
+    PendingActionConflictError,
+    PendingActionState,
     PendingTransactionConflictError,
     add_savings_progress,
     add_transaction,
     baht_to_satang,
-    delete_latest_transaction,
-    delete_pending_transaction,
+    confirm_delete_transaction,
+    create_pending_action,
     create_pending_transaction,
-    get_pending_transaction,
+    delete_latest_transaction,
+    delete_pending_action,
+    delete_pending_transaction,
+    get_latest_transaction,
+    get_pending_action,
     get_savings_goal,
+    get_pending_transaction,
     get_webhook_event,
     list_recent_transactions,
     mark_webhook_processed,
@@ -257,6 +265,288 @@ def test_webhook_event_can_only_be_claimed_once(db_session):
     assert get_webhook_event("01HLINEEVENT", session=db_session).reply_sent is True
 
 
+def test_pending_action_lifecycle_and_fixed_ttl(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", session=db_session
+    )
+
+    absent = get_pending_action("U-alice", now=now, session=db_session)
+    assert absent.state == PendingActionState.ABSENT
+    assert absent.action is None
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    assert not create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+
+    active = get_pending_action("U-alice", now=now, session=db_session)
+    assert active.state == PendingActionState.ACTIVE
+    assert active.action is not None
+    assert len(active.action.action_id) == 32
+    assert active.action.version == 1
+    assert active.action.created_at.replace(tzinfo=timezone.utc) == now
+    assert active.action.expires_at.replace(tzinfo=timezone.utc) == (
+        now + PENDING_ACTION_TTL
+    )
+
+    assert not delete_pending_action(
+        "U-alice",
+        2,
+        expected_action_id=active.action.action_id,
+        now=now,
+        session=db_session,
+    )
+    assert delete_pending_action(
+        "U-alice",
+        1,
+        expected_action_id=active.action.action_id,
+        now=now,
+        session=db_session,
+    )
+
+
+def test_pending_action_expiry_is_distinct_from_absence(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", session=db_session
+    )
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+
+    expired = get_pending_action(
+        "U-alice", now=now + PENDING_ACTION_TTL, session=db_session
+    )
+    assert expired.state == PendingActionState.EXPIRED_CLEANED
+    assert expired.action is None
+    assert get_pending_action(
+        "U-alice", now=now + PENDING_ACTION_TTL, session=db_session
+    ).state == PendingActionState.ABSENT
+
+
+def test_confirm_delete_is_atomic_user_scoped_and_handles_missing_target(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", session=db_session
+    )
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+
+    with pytest.raises(PendingActionConflictError):
+        confirm_delete_transaction(
+            "U-alice",
+            action.version + 1,
+            expected_action_id=action.action_id,
+            target_transaction_id=target.id,
+            now=now,
+            session=db_session,
+        )
+    assert db_session.get(Transaction, target.id) is target
+    assert db_session.get(PendingAction, "U-alice") is action
+
+    with pytest.raises(PendingActionConflictError):
+        confirm_delete_transaction(
+            "U-bob",
+            action.version,
+            expected_action_id=action.action_id,
+            target_transaction_id=target.id,
+            now=now,
+            session=db_session,
+        )
+    assert db_session.get(Transaction, target.id) is target
+    assert db_session.get(PendingAction, "U-alice") is action
+
+    deleted = confirm_delete_transaction(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    assert deleted is target
+    assert db_session.get(Transaction, target.id) is None
+
+    missing_id = target.id + 100
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=missing_id,
+        now=now,
+        session=db_session,
+    )
+    missing_action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(missing_action)
+    assert confirm_delete_transaction(
+        "U-alice",
+        missing_action.version,
+        expected_action_id=missing_action.action_id,
+        target_transaction_id=missing_id,
+        now=now,
+        session=db_session,
+    ) is None
+
+
+def test_get_latest_transaction_uses_created_at_then_id(db_session):
+    first = add_transaction(
+        "U-alice",
+        "expense",
+        "10",
+        "อื่นๆ",
+        occurred_on=date(2026, 12, 31),
+        session=db_session,
+    )
+    second = add_transaction(
+        "U-alice",
+        "expense",
+        "20",
+        "อื่นๆ",
+        occurred_on=date(2026, 1, 1),
+        session=db_session,
+    )
+    first.created_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    second.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    db_session.flush()
+
+    assert get_latest_transaction("U-alice", session=db_session).id == first.id
+
+    second.created_at = first.created_at
+    db_session.flush()
+    assert second.id > first.id
+    assert get_latest_transaction("U-alice", session=db_session).id == second.id
+
+
+def test_pending_action_lazy_expiry_detects_replacement(db_session, monkeypatch):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", session=db_session
+    )
+    old_action_id = "a" * 32
+    replacement_action_id = "b" * 32
+    db_session.add(
+        PendingAction(
+            line_user_id="U-alice",
+            action_id=old_action_id,
+            version=1,
+            action_type="confirm_delete",
+            target_transaction_id=target.id,
+            created_at=now - timedelta(minutes=20),
+            expires_at=now - timedelta(minutes=10),
+        )
+    )
+    db_session.flush()
+    original_execute = db_session.execute
+    replaced = False
+
+    def replace_before_cleanup(statement, *args, **kwargs):
+        nonlocal replaced
+        is_action_delete = (
+            getattr(statement, "is_delete", False)
+            and statement.table.name == "pending_actions"
+        )
+        if is_action_delete and not replaced:
+            replaced = True
+            original_execute(
+                delete(PendingAction)
+                .where(PendingAction.line_user_id == "U-alice")
+                .execution_options(synchronize_session=False)
+            )
+            original_execute(
+                insert(PendingAction).values(
+                    line_user_id="U-alice",
+                    action_id=replacement_action_id,
+                    version=7,
+                    action_type="confirm_delete",
+                    target_transaction_id=target.id,
+                    created_at=now,
+                    expires_at=now + PENDING_ACTION_TTL,
+                )
+            )
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", replace_before_cleanup)
+    with pytest.raises(
+        PendingActionConflictError,
+        match="pending action changed during expiry cleanup",
+    ):
+        get_pending_action("U-alice", now=now, session=db_session)
+
+    db_session.expire_all()
+    replacement = db_session.get(PendingAction, "U-alice")
+    assert replacement is not None
+    assert replacement.action_id == replacement_action_id
+    assert replacement.version == 7
+    assert db_session.get(Transaction, target.id) is not None
+
+
+def test_pending_action_occ_delete_uses_reliable_rowcount_for_postgresql(
+    db_session,
+    monkeypatch,
+):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", session=db_session
+    )
+    original_execute = db_session.execute
+
+    class InsertResultWithUnknownRowcount:
+        rowcount = -1
+
+        def __init__(self, result):
+            self._result = result
+
+        def __getattr__(self, name):
+            return getattr(self._result, name)
+
+    def hide_insert_rowcount(statement, *args, **kwargs):
+        result = original_execute(statement, *args, **kwargs)
+        if (
+            getattr(statement, "is_insert", False)
+            and statement.table.name == "pending_actions"
+        ):
+            return InsertResultWithUnknownRowcount(result)
+        return result
+
+    monkeypatch.setattr(db_session.get_bind().dialect, "name", "postgresql")
+    monkeypatch.setattr(db_session, "execute", hide_insert_rowcount)
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+
+    assert delete_pending_action(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        now=now,
+        session=db_session,
+    )
+
+
 def test_init_db_upgrades_legacy_webhook_table(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
     with engine.begin() as connection:
@@ -272,6 +562,27 @@ def test_init_db_upgrades_legacy_webhook_table(tmp_path):
 
     columns = {item["name"] for item in inspect(engine).get_columns("processed_webhook_events")}
     assert {"response_text", "reply_sent"}.issubset(columns)
+    engine.dispose()
+
+
+def test_init_db_creates_pending_action_table(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'pending-action.db'}")
+
+    init_db(engine)
+
+    assert inspect(engine).has_table("pending_actions")
+    columns = {
+        column["name"] for column in inspect(engine).get_columns("pending_actions")
+    }
+    assert columns == {
+        "line_user_id",
+        "action_id",
+        "version",
+        "action_type",
+        "target_transaction_id",
+        "created_at",
+        "expires_at",
+    }
     engine.dispose()
 
 
@@ -519,3 +830,5 @@ def test_failed_lazy_expiry_delete_surfaces_concurrent_modification(
     assert pending is not None
     assert pending.version == 2
     assert pending.expires_at.replace(tzinfo=timezone.utc) == refreshed_expiry
+    get_latest_transaction,
+    get_pending_action,

@@ -112,6 +112,26 @@ def format_edit_confirmation(transaction: Mapping[str, object]) -> str:
     return limit_line_text("\n".join(lines))
 
 
+def format_delete_confirmation_prompt(transaction: Mapping[str, object]) -> str:
+    """Identify the exact transaction awaiting deletion confirmation."""
+
+    kind = _kind(transaction.get("type"))
+    amount = abs(_decimal(transaction.get("amount", 0)))
+    category = _clean(transaction.get("category"), "ไม่ระบุหมวด")
+    note = _clean(transaction.get("note"), "ไม่ระบุรายการ")
+    happened_on = _format_date(transaction.get("date")) or "ไม่ระบุวันที่"
+    lines = [
+        "ยืนยันลบรายการนี้หรือไม่?",
+        f"ประเภท: {kind}",
+        f"รายการ: {note}",
+        f"จำนวน: {format_amount(amount)} บาท",
+        f"หมวด: {category}",
+        f"วันที่: {happened_on}",
+        'พิมพ์ "ยืนยัน" เพื่อลบ หรือ "ยกเลิก"',
+    ]
+    return limit_line_text("\n".join(lines))
+
+
 def format_recent_transactions(
     transactions: Iterable[Mapping[str, object]],
     *,
@@ -245,7 +265,7 @@ def format_help_message() -> str:
         "ระบุเองได้: จ่าย 50 หรือ รับ 500\n"
         "ดูรายการ: รายการล่าสุด\n"
         "ดูสรุป: สรุปเดือนนี้\n"
-        "ลบรายการ: ลบล่าสุด\n"
+        "ลบรายการ: ลบล่าสุด (ต้องยืนยันก่อนลบ)\n"
         "แก้ไขรายการล่าสุด: แก้ไข ข้าว 60\n"
         "ตั้งเป้าหมาย: ตั้งเป้า 1500 ซื้อหนังสือ\n"
         "เพิ่มเงินออม: ออม 100\n"

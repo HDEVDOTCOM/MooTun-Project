@@ -98,6 +98,23 @@ class PendingTransaction(Base):
         return Decimal(self.amount_satang) / Decimal(100)
 
 
+class PendingAction(Base):
+    """Temporary state for a user action that requires confirmation."""
+
+    __tablename__ = "pending_actions"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="ck_pending_actions_positive_version"),
+    )
+
+    line_user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    action_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_transaction_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SavingsGoal(Base):
     __tablename__ = "savings_goals"
     __table_args__ = (
