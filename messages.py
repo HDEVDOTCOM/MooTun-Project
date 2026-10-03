@@ -132,6 +132,47 @@ def format_delete_confirmation_prompt(transaction: Mapping[str, object]) -> str:
     return limit_line_text("\n".join(lines))
 
 
+def format_delete_success(transaction: Mapping[str, object]) -> str:
+    """Confirm a completed deletion and advertise the 10-minute undo window."""
+
+    amount = abs(_decimal(transaction.get("amount", 0)))
+    category = _clean(transaction.get("category"), "ไม่ระบุหมวด")
+    happened_on = _format_date(transaction.get("date")) or "ไม่ระบุวันที่"
+    return limit_line_text(
+        "🗑️ ลบรายการเรียบร้อยแล้ว\n"
+        f"{category} · {format_amount(amount)} บาท · {happened_on}\n"
+        'พิมพ์ "เลิกทำ" ภายใน 10 นาทีเพื่อกู้คืน'
+    )
+
+
+def format_undo_restored(transaction: Mapping[str, object]) -> str:
+    """Confirm that a deleted transaction was restored from its snapshot."""
+
+    amount = abs(_decimal(transaction.get("amount", 0)))
+    category = _clean(transaction.get("category"), "ไม่ระบุหมวด")
+    happened_on = _format_date(transaction.get("date")) or "ไม่ระบุวันที่"
+    return limit_line_text(
+        "↩️ กู้คืนรายการเรียบร้อยแล้ว\n"
+        f"{category} · {format_amount(amount)} บาท · {happened_on}"
+    )
+
+
+def format_undo_expired() -> str:
+    return "หมดเวลาย้อนกลับแล้วครับ รายการที่ลบไปแล้วไม่สามารถกู้คืนได้"
+
+
+def format_undo_unavailable() -> str:
+    return "ไม่มีรายการให้ย้อนกลับครับ"
+
+
+def format_delete_not_confirmed_yet() -> str:
+    return 'ยังไม่มีการลบให้ย้อนกลับ กรุณายืนยันการลบก่อน'
+
+
+def format_undo_id_collision() -> str:
+    return "ไม่สามารถย้อนกลับได้เนื่องจากมีข้อมูลอื่นทับซ้อน"
+
+
 def format_recent_transactions(
     transactions: Iterable[Mapping[str, object]],
     *,
@@ -266,6 +307,7 @@ def format_help_message() -> str:
         "ดูรายการ: รายการล่าสุด\n"
         "ดูสรุป: สรุปเดือนนี้\n"
         "ลบรายการ: ลบล่าสุด (ต้องยืนยันก่อนลบ)\n"
+        "ย้อนกลับการลบ: เลิกทำ (ภายใน 10 นาที)\n"
         "แก้ไขรายการล่าสุด: แก้ไข ข้าว 60\n"
         "ตั้งเป้าหมาย: ตั้งเป้า 1500 ซื้อหนังสือ\n"
         "เพิ่มเงินออม: ออม 100\n"

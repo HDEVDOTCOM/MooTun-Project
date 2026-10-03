@@ -580,7 +580,10 @@ def test_delete_confirmation_deletes_bound_target_only(webhook_client):
         assert session.get(Transaction, bound_target_id) is None
         assert session.get(Transaction, newer_id) is not None
         assert session.scalar(select(func.count(Transaction.id))) == 2
-        assert session.get(PendingAction, "U-alice") is None
+        undo = session.get(PendingAction, "U-alice")
+        assert undo is not None
+        assert undo.action_type == "undo_delete"
+        assert undo.snapshot_transaction_id == bound_target_id
 
 
 def test_delete_confirmation_is_user_isolated(webhook_client):
@@ -930,7 +933,9 @@ def test_delete_confirm_cancel_webhook_redelivery_is_idempotent(webhook_client):
     assert client.post("/webhook", content=confirm_body, headers=confirm_headers).status_code == 200
     with Session(engine) as session:
         assert session.scalar(select(func.count(Transaction.id))) == 0
-        assert session.get(PendingAction, "U-alice") is None
+        undo = session.get(PendingAction, "U-alice")
+        assert undo is not None
+        assert undo.action_type == "undo_delete"
     assert [reply[0] for reply in replies].count("reply-evt-idem-confirm") == 1
 
 
@@ -1274,3 +1279,337 @@ def test_unsafe_rule_interactions_do_not_write_transactions(webhook_client):
         assert session.scalar(select(func.count(Transaction.id))) == 0
         assert session.scalar(select(func.count(ProcessedWebhookEvent.webhook_event_id))) == 10
     assert len(replies) == 10
+
+
+UNDO_EXPIRED_REPLY = "หมดเวลาย้อนกลับแล้วครับ รายการที่ลบไปแล้วไม่สามารถกู้คืนได้"
+UNDO_UNAVAILABLE_REPLY = "ไม่มีรายการให้ย้อนกลับครับ"
+DELETE_NOT_CONFIRMED_REPLY = "ยังไม่มีการลบให้ย้อนกลับ กรุณายืนยันการลบก่อน"
+UNDO_ID_COLLISION_REPLY = "ไม่สามารถย้อนกลับได้เนื่องจากมีข้อมูลอื่นทับซ้อน"
+
+
+def _create_undo_snapshot(
+    client,
+    engine,
+    *,
+    user: str = "U-alice",
+    prefix: str = "evt-undo",
+) -> tuple[int, object]:
+    assert _post_text(client, f"{prefix}-seed", user, "ข้าว 40").status_code == 200
+    with Session(engine) as session:
+        original = session.scalar(
+            select(Transaction).where(Transaction.line_user_id == user)
+        )
+        original_id = original.id
+        original_created_at = original.created_at
+    assert _post_text(client, f"{prefix}-request", user, "ลบล่าสุด").status_code == 200
+    assert _post_text(client, f"{prefix}-confirm", user, "ยืนยัน").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, user)
+        assert action is not None
+        assert action.action_type == "undo_delete"
+    return original_id, original_created_at
+
+
+def _expire_pending_action(engine, user: str = "U-alice") -> None:
+    with Session(engine) as session:
+        action = session.get(PendingAction, user)
+        assert action is not None
+        action.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+
+
+def test_undo_restores_exact_original_transaction(webhook_client):
+    client, engine, replies = webhook_client
+    original_id, original_created_at = _create_undo_snapshot(client, engine)
+
+    assert _post_text(client, "evt-undo-apply", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1].startswith("↩️ กู้คืนรายการเรียบร้อยแล้ว")
+    with Session(engine) as session:
+        items = list(session.scalars(select(Transaction)))
+        assert len(items) == 1
+        assert items[0].id == original_id
+        assert items[0].created_at == original_created_at
+        assert items[0].description == "ข้าว"
+        assert items[0].amount_satang == 4000
+        assert session.get(PendingAction, "U-alice") is None
+
+
+def test_undo_restores_position_with_newer_transactions_present(webhook_client):
+    client, engine, replies = webhook_client
+    original_id, _ = _create_undo_snapshot(client, engine)
+    assert _post_text(client, "evt-undo-newer", "U-alice", "BTS 47").status_code == 200
+    with Session(engine) as session:
+        newer_id = session.scalar(
+            select(Transaction.id).where(Transaction.description == "BTS")
+        )
+        assert newer_id is not None
+
+    assert _post_text(client, "evt-undo-older", "U-alice", "เลิกทำ").status_code == 200
+    with Session(engine) as session:
+        restored = session.get(Transaction, original_id)
+        assert restored is not None
+        assert restored.id < newer_id
+        assert session.scalar(select(func.count(Transaction.id))) == 2
+
+
+def test_undo_id_collision_consumes_action_and_reports_conflict(webhook_client):
+    client, engine, replies = webhook_client
+    original_id, _ = _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        session.execute(
+            insert(Transaction).values(
+                id=original_id,
+                line_user_id="U-alice",
+                transaction_type="expense",
+                amount_satang=9999,
+                category="อื่นๆ",
+                description="ทับซ้อน",
+                occurred_on=date(2026, 9, 23),
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    assert _post_text(client, "evt-undo-collide", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == UNDO_ID_COLLISION_REPLY
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        items = list(session.scalars(select(Transaction)))
+        assert len(items) == 1
+        assert items[0].description == "ทับซ้อน"
+
+
+def test_cancel_with_active_undo_preserves_undo_and_cancels_draft(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    assert _post_text(client, "evt-undo-cancel-draft", "U-alice", "กาแฟ").status_code == 200
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(client, "evt-undo-cancel", "U-alice", "ยกเลิก").status_code == 200
+    assert replies[-1][1] == "ยกเลิกรายการที่ค้างไว้แล้วครับ"
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert _row_state(action) == undo_state
+        assert session.get(PendingTransaction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_confirm_with_active_undo_preserves_undo_without_deleting(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(client, "evt-undo-confirm-again", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("ยังไม่เข้าใจข้อความนี้")
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert _row_state(action) == undo_state
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["BTS 47", "แก้ ข้าว 60", "กาแฟ"],
+)
+def test_active_undo_survives_unrelated_financial_work(webhook_client, mutation):
+    client, engine, _ = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(
+        client, "evt-undo-unrelated", "U-alice", mutation
+    ).status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert _row_state(action) == undo_state
+
+
+def test_stateless_commands_preserve_active_undo(webhook_client):
+    client, engine, _ = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    for index, command in enumerate(
+        ("ช่วยเหลือ", "รายการล่าสุด", "สรุปเดือนนี้", "เป้าหมายการออม")
+    ):
+        assert _post_text(
+            client, f"evt-undo-stateless-{index}", "U-alice", command
+        ).status_code == 200
+        with Session(engine) as session:
+            action = session.get(PendingAction, "U-alice")
+            assert action is not None
+            assert _row_state(action) == undo_state
+
+
+def test_delete_latest_without_transactions_preserves_active_undo(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(client, "evt-undo-empty-delete", "U-alice", "ลบล่าสุด").status_code == 200
+    assert replies[-1][1] == "ยังไม่มีรายการให้ลบ"
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert _row_state(action) == undo_state
+
+
+def test_delete_latest_replaces_active_undo_with_new_confirm(webhook_client):
+    client, engine, _ = webhook_client
+    _create_undo_snapshot(client, engine)
+    assert _post_text(client, "evt-undo-replace-new", "U-alice", "BTS 47").status_code == 200
+    with Session(engine) as session:
+        bts_id = session.scalar(
+            select(Transaction.id).where(Transaction.description == "BTS")
+        )
+
+    assert _post_text(client, "evt-undo-replace", "U-alice", "ลบล่าสุด").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete"
+        assert action.target_transaction_id == bts_id
+        assert action.snapshot_transaction_id is None
+        assert action.snapshot_created_at is None
+        assert session.get(Transaction, bts_id) is not None
+
+
+def test_delete_latest_confirm_at_active_undo_is_rejected(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(client, "evt-undo-cannot-confirm", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1].startswith("↩️")
+    assert _post_text(client, "evt-undo-confirm-after", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("ยังไม่เข้าใจข้อความนี้")
+
+
+def test_active_confirm_delete_rejects_undo_until_confirmed(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-confirm-undo-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-confirm-undo-request", "U-alice", "ลบล่าสุด").status_code == 200
+
+    assert _post_text(client, "evt-confirm-undo-attempt", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == DELETE_NOT_CONFIRMED_REPLY
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete"
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+
+
+def test_undo_without_pending_action_reports_unavailable(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-undo-none", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == UNDO_UNAVAILABLE_REPLY
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_expired_undo_reports_expiry_and_preserves_draft(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    assert _post_text(client, "evt-expired-undo-draft", "U-alice", "กาแฟ").status_code == 200
+    _expire_pending_action(engine)
+
+    assert _post_text(client, "evt-expired-undo", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == UNDO_EXPIRED_REPLY
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.get(PendingTransaction, "U-alice") is not None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_expired_undo_cancel_falls_through_to_draft_cancellation(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    assert _post_text(client, "evt-expired-undo-cancel-draft", "U-alice", "กาแฟ").status_code == 200
+    _expire_pending_action(engine)
+
+    assert _post_text(client, "evt-expired-undo-cancel", "U-alice", "ยกเลิก").status_code == 200
+    assert replies[-1][1] != UNDO_EXPIRED_REPLY
+    assert replies[-1][1] == "ยกเลิกรายการที่ค้างไว้แล้วครับ"
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.get(PendingTransaction, "U-alice") is None
+
+
+def test_expired_undo_confirm_is_not_reinterpreted(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    _expire_pending_action(engine)
+
+    assert _post_text(client, "evt-expired-undo-confirm", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("ยังไม่เข้าใจข้อความนี้")
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_expired_confirm_undo_command_reports_unavailable(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-expired-confirm-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-expired-confirm-request", "U-alice", "ลบล่าสุด").status_code == 200
+    _expire_pending_action(engine)
+
+    assert _post_text(client, "evt-expired-confirm-undo", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == UNDO_UNAVAILABLE_REPLY
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+
+
+def test_pending_completion_preserves_active_undo(webhook_client):
+    client, engine, _ = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        undo_state = _row_state(session.get(PendingAction, "U-alice"))
+
+    assert _post_text(client, "evt-undo-complete-draft", "U-alice", "กาแฟ").status_code == 200
+    assert _post_text(client, "evt-undo-complete-amount", "U-alice", "50").status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert _row_state(action) == undo_state
+        assert session.get(PendingTransaction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 1
+
+
+def test_undo_occ_loser_is_cached_and_not_reinterpreted(webhook_client, monkeypatch):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    calls = 0
+
+    def lose_restore(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise app_module.PendingActionConflictError("simulated undo race")
+
+    monkeypatch.setattr(app_module, "restore_deleted_transaction", lose_restore)
+    body, headers = _signed_body(
+        {"events": [_text_event("evt-undo-occ", "U-alice", "เลิกทำ")]}
+    )
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    retry_reply = "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert replies[-1][1] == retry_reply
+    assert calls == 1
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    assert calls == 1
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "undo_delete"
+        event = session.get(ProcessedWebhookEvent, "evt-undo-occ")
+        assert event.response_text == retry_reply

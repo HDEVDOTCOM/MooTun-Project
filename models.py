@@ -45,6 +45,7 @@ class Transaction(Base):
             "occurred_on",
             "created_at",
         ),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -113,6 +114,20 @@ class PendingAction(Base):
     target_transaction_id: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Phase 1E undo snapshot. All NULL for ``confirm_delete`` and populated only
+    # for ``undo_delete`` so a deleted transaction can be restored byte-for-byte.
+    snapshot_transaction_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    snapshot_transaction_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    snapshot_amount_satang: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    snapshot_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    snapshot_description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    snapshot_occurred_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    snapshot_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class SavingsGoal(Base):

@@ -57,6 +57,7 @@ def init_db(db_engine: Engine | None = None) -> None:
     Base.metadata.create_all(bind=active_engine)
     _upgrade_webhook_event_table(active_engine)
     _upgrade_pending_transaction_table(active_engine)
+    _upgrade_pending_action_table(active_engine)
 
 
 def _upgrade_webhook_event_table(db_engine: Engine) -> None:
@@ -92,6 +93,36 @@ def _upgrade_pending_transaction_table(db_engine: Engine) -> None:
                     "ADD COLUMN inference_rule VARCHAR(100)"
                 )
             )
+
+
+def _upgrade_pending_action_table(db_engine: Engine) -> None:
+    """Add the Phase 1E undo snapshot columns to an existing action table."""
+
+    table_name = "pending_actions"
+    columns = {column["name"] for column in inspect(db_engine).get_columns(table_name)}
+    timestamp_type = (
+        "TIMESTAMP WITH TIME ZONE"
+        if db_engine.dialect.name == "postgresql"
+        else "DATETIME"
+    )
+    additions = {
+        "snapshot_transaction_id": "INTEGER",
+        "snapshot_transaction_type": "VARCHAR(16)",
+        "snapshot_amount_satang": "BIGINT",
+        "snapshot_category": "VARCHAR(100)",
+        "snapshot_description": "VARCHAR(500)",
+        "snapshot_occurred_on": "DATE",
+        "snapshot_created_at": timestamp_type,
+    }
+    statements = [
+        f"ALTER TABLE {table_name} ADD COLUMN {name} {sql_type}"
+        for name, sql_type in additions.items()
+        if name not in columns
+    ]
+    if statements:
+        with db_engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
 
 
 @contextmanager

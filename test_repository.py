@@ -9,9 +9,11 @@ from models import Base, PendingAction, PendingTransaction, Transaction
 from database import init_db
 from repository import (
     PENDING_ACTION_TTL,
+    UNDO_DELETE_TTL,
     PendingActionConflictError,
     PendingActionState,
     PendingTransactionConflictError,
+    RestoreOutcome,
     add_savings_progress,
     add_transaction,
     baht_to_satang,
@@ -30,6 +32,7 @@ from repository import (
     mark_webhook_processed,
     mark_webhook_replied,
     monthly_summary,
+    restore_deleted_transaction,
     set_savings_goal,
     set_webhook_response,
     update_latest_transaction,
@@ -351,6 +354,7 @@ def test_confirm_delete_is_atomic_user_scoped_and_handles_missing_target(db_sess
         session=db_session,
     )
     action = db_session.get(PendingAction, "U-alice")
+    original_version = action.version
 
     with pytest.raises(PendingActionConflictError):
         confirm_delete_transaction(
@@ -387,6 +391,27 @@ def test_confirm_delete_is_atomic_user_scoped_and_handles_missing_target(db_sess
     assert deleted is target
     assert db_session.get(Transaction, target.id) is None
 
+    undo = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(undo)
+    assert undo.action_type == "undo_delete"
+    assert undo.version == original_version + 1
+    assert undo.target_transaction_id == target.id
+    assert undo.snapshot_transaction_id == target.id
+    assert undo.snapshot_transaction_type == target.transaction_type
+    assert undo.snapshot_amount_satang == target.amount_satang
+    assert undo.snapshot_category == target.category
+    assert undo.snapshot_description == target.description
+    assert undo.snapshot_occurred_on == target.occurred_on
+    assert undo.snapshot_created_at is not None
+    assert undo.expires_at.replace(tzinfo=timezone.utc) == now + UNDO_DELETE_TTL
+
+    assert delete_pending_action(
+        "U-alice",
+        undo.version,
+        expected_action_id=undo.action_id,
+        now=now,
+        session=db_session,
+    )
     missing_id = target.id + 100
     assert create_pending_action(
         "U-alice",
@@ -405,6 +430,8 @@ def test_confirm_delete_is_atomic_user_scoped_and_handles_missing_target(db_sess
         now=now,
         session=db_session,
     ) is None
+    db_session.expire_all()
+    assert db_session.get(PendingAction, "U-alice") is None
 
 
 def test_get_latest_transaction_uses_created_at_then_id(db_session):
@@ -582,7 +609,59 @@ def test_init_db_creates_pending_action_table(tmp_path):
         "target_transaction_id",
         "created_at",
         "expires_at",
+        "snapshot_transaction_id",
+        "snapshot_transaction_type",
+        "snapshot_amount_satang",
+        "snapshot_category",
+        "snapshot_description",
+        "snapshot_occurred_on",
+        "snapshot_created_at",
     }
+    engine.dispose()
+
+
+def test_fresh_sqlite_does_not_reuse_deleted_highest_transaction_id(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'undo-id-allocation.db'}")
+    init_db(engine)
+    with engine.connect() as connection:
+        ddl = connection.scalar(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transactions'")
+        )
+        assert ddl is not None and "AUTOINCREMENT" in ddl.upper()
+        assert connection.scalar(
+            text("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence'")
+        ) == 1
+
+    with Session(engine) as session:
+        first = add_transaction("U-alice", "expense", "10", "อาหาร", session=session)
+        second = add_transaction("U-alice", "expense", "20", "อาหาร", session=session)
+        assert (first.id, second.id) == (1, 2)
+        original_id = second.id
+        original_created_at = second.created_at
+        original_occurred_on = second.occurred_on
+        session.delete(second)
+        session.flush()
+
+        newer = add_transaction("U-alice", "income", "30", "รายรับอื่นๆ", session=session)
+        assert newer.id > original_id, "SQLite reused the deleted ID; undo would collide"
+        assert newer.id == 3
+
+        restored = Transaction(
+            id=original_id,
+            line_user_id="U-alice",
+            transaction_type="expense",
+            amount_satang=2000,
+            category="อาหาร",
+            occurred_on=original_occurred_on,
+            created_at=original_created_at,
+        )
+        session.add(restored)
+        session.flush()
+        assert restored.id == 2
+        assert session.scalar(select(Transaction).where(Transaction.id == 2)) is restored
+        assert newer.id == 3
+        session.commit()
+
     engine.dispose()
 
 
@@ -832,3 +911,129 @@ def test_failed_lazy_expiry_delete_surfaces_concurrent_modification(
     assert pending.expires_at.replace(tzinfo=timezone.utc) == refreshed_expiry
     get_latest_transaction,
     get_pending_action,
+
+
+def test_init_db_upgrades_legacy_pending_action_table(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-action.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE pending_actions ("
+                "line_user_id VARCHAR(128) PRIMARY KEY, "
+                "action_id VARCHAR(32) NOT NULL, "
+                "version INTEGER NOT NULL, "
+                "action_type VARCHAR(32) NOT NULL, "
+                "target_transaction_id INTEGER NOT NULL, "
+                "created_at DATETIME NOT NULL, "
+                "expires_at DATETIME NOT NULL)"
+            )
+        )
+
+    init_db(engine)
+
+    columns = {
+        column["name"] for column in inspect(engine).get_columns("pending_actions")
+    }
+    assert {
+        "snapshot_transaction_id",
+        "snapshot_transaction_type",
+        "snapshot_amount_satang",
+        "snapshot_category",
+        "snapshot_description",
+        "snapshot_occurred_on",
+        "snapshot_created_at",
+    }.issubset(columns)
+    engine.dispose()
+
+
+def test_restore_deleted_transaction_round_trip_and_id_collision(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction(
+        "U-alice", "expense", "50", "อาหาร", description="ข้าว", session=db_session
+    )
+    db_session.refresh(target)
+    original_id = target.id
+    original_created_at = target.created_at
+
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=original_id,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+    assert confirm_delete_transaction(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        target_transaction_id=original_id,
+        now=now,
+        session=db_session,
+    ) is not None
+
+    undo = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(undo)
+    result = restore_deleted_transaction(
+        "U-alice",
+        undo.version,
+        expected_action_id=undo.action_id,
+        now=now,
+        session=db_session,
+    )
+    assert result.outcome is RestoreOutcome.RESTORED
+    assert result.transaction is not None
+    assert result.transaction.id == original_id
+    assert result.transaction.created_at == original_created_at
+    db_session.expire_all()
+    assert db_session.get(PendingAction, "U-alice") is None
+
+    other = add_transaction("U-alice", "expense", "70", "อื่นๆ", session=db_session)
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=other.id,
+        now=now,
+        session=db_session,
+    )
+    other_action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(other_action)
+    assert confirm_delete_transaction(
+        "U-alice",
+        other_action.version,
+        expected_action_id=other_action.action_id,
+        target_transaction_id=other.id,
+        now=now,
+        session=db_session,
+    ) is not None
+
+    undo = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(undo)
+    snapshot_id = undo.snapshot_transaction_id
+    db_session.execute(
+        insert(Transaction).values(
+            id=snapshot_id,
+            line_user_id="U-alice",
+            transaction_type="expense",
+            amount_satang=1234,
+            category="อื่นๆ",
+            description="ทับซ้อน",
+            occurred_on=date(2026, 9, 23),
+            created_at=now,
+        )
+    )
+    db_session.flush()
+
+    outcome = restore_deleted_transaction(
+        "U-alice",
+        undo.version,
+        expected_action_id=undo.action_id,
+        now=now,
+        session=db_session,
+    )
+    assert outcome.outcome is RestoreOutcome.ID_COLLISION
+    assert outcome.transaction is None
+    db_session.expire_all()
+    assert db_session.get(PendingAction, "U-alice") is None
+    assert db_session.get(Transaction, snapshot_id).description == "ทับซ้อน"

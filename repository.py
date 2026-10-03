@@ -34,6 +34,8 @@ from models import (
 MoneyInput = Decimal | int | str
 PENDING_TRANSACTION_TTL = timedelta(hours=1)
 PENDING_ACTION_TTL = timedelta(minutes=10)
+CONFIRM_DELETE_TTL = timedelta(minutes=10)
+UNDO_DELETE_TTL = timedelta(minutes=10)
 
 
 class PendingTransactionConflictError(RuntimeError):
@@ -50,10 +52,22 @@ class PendingActionState(str, Enum):
     ABSENT = "absent"
 
 
+class RestoreOutcome(str, Enum):
+    RESTORED = "restored"
+    ID_COLLISION = "id_collision"
+
+
 @dataclass(frozen=True)
 class PendingActionResult:
     state: PendingActionState
     action: PendingAction | None = None
+    action_type: str | None = None
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    outcome: RestoreOutcome
+    transaction: Transaction | None = None
 
 
 def baht_to_satang(amount: MoneyInput) -> int:
@@ -514,7 +528,10 @@ def get_pending_action(
             raise PendingActionConflictError(
                 "pending action changed during expiry cleanup"
             )
-        return PendingActionResult(PendingActionState.EXPIRED_CLEANED)
+        return PendingActionResult(
+            PendingActionState.EXPIRED_CLEANED,
+            action_type=action.action_type,
+        )
 
 
 def create_pending_action(
@@ -591,13 +608,31 @@ def invalidate_pending_action(
     now: datetime | None = None,
     session: Session | None = None,
 ) -> bool:
-    return delete_pending_action(
-        line_user_id,
-        expected_version,
-        expected_action_id=expected_action_id,
-        now=now,
-        session=session,
-    )
+    """Discard an unrelated ``confirm_delete`` action.
+
+    An active ``undo_delete`` snapshot is intentionally preserved: unrelated
+    transactions, edits, draft completions, and stateless commands must not
+    consume the user's pending undo opportunity.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "confirm_delete",
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        return result.rowcount == 1
 
 
 def confirm_delete_transaction(
@@ -609,7 +644,13 @@ def confirm_delete_transaction(
     now: datetime | None = None,
     session: Session | None = None,
 ) -> Transaction | None:
-    """Consume an exact confirmation and delete its user-scoped target."""
+    """Consume an exact confirmation, delete its target, and open an undo window.
+
+    The whole confirm -> undo transition runs in one outer transaction: the
+    ``confirm_delete`` row is replaced by an ``undo_delete`` snapshot and the
+    target ``Transaction`` is deleted.  A missing target consumes the
+    confirmation without creating an undo snapshot and returns ``None``.
+    """
 
     user_id = _validate_user_id(line_user_id)
     current_time = now or datetime.now(timezone.utc)
@@ -617,9 +658,8 @@ def confirm_delete_transaction(
         current_time = current_time.replace(tzinfo=timezone.utc)
 
     with _session_context(session) as db:
-        result = db.execute(
-            delete(PendingAction)
-            .where(
+        action = db.scalar(
+            select(PendingAction).where(
                 PendingAction.line_user_id == user_id,
                 PendingAction.action_id == expected_action_id,
                 PendingAction.version == expected_version,
@@ -627,10 +667,8 @@ def confirm_delete_transaction(
                 PendingAction.target_transaction_id == target_transaction_id,
                 PendingAction.expires_at > current_time,
             )
-            .execution_options(synchronize_session=False)
         )
-        db.flush()
-        if result.rowcount == 0:
+        if action is None:
             raise PendingActionConflictError(
                 "pending action changed during confirmation"
             )
@@ -642,10 +680,194 @@ def confirm_delete_transaction(
             )
         )
         if item is None:
+            result = db.execute(
+                delete(PendingAction)
+                .where(
+                    PendingAction.line_user_id == user_id,
+                    PendingAction.action_id == expected_action_id,
+                    PendingAction.version == expected_version,
+                    PendingAction.action_type == "confirm_delete",
+                    PendingAction.target_transaction_id == target_transaction_id,
+                    PendingAction.expires_at > current_time,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            db.flush()
+            if result.rowcount == 0:
+                raise PendingActionConflictError(
+                    "pending action changed during confirmation"
+                )
+            db.expunge(action)
             return None
+
+        result = db.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "confirm_delete",
+                PendingAction.target_transaction_id == target_transaction_id,
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                action_type="undo_delete",
+                version=expected_version + 1,
+                snapshot_transaction_id=item.id,
+                snapshot_transaction_type=item.transaction_type,
+                snapshot_amount_satang=item.amount_satang,
+                snapshot_category=item.category,
+                snapshot_description=item.description,
+                snapshot_occurred_on=item.occurred_on,
+                snapshot_created_at=item.created_at,
+                expires_at=current_time + UNDO_DELETE_TTL,
+            )
+        )
+        if result.rowcount == 0:
+            raise PendingActionConflictError(
+                "pending action changed during confirmation"
+            )
+
+        db.expire(action)
         db.delete(item)
         db.flush()
         return item
+
+
+def replace_pending_action_with_confirm(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    expected_action_type: str,
+    target_transaction_id: int,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    """OCC-safely replace the current action with a fresh ``confirm_delete``.
+
+    Used when ``ลบล่าสุด`` arrives while an ``undo_delete`` snapshot is active:
+    the stale undo opportunity is intentionally discarded and re-pointed at the
+    current latest transaction.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == expected_action_type,
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                action_id=uuid4().hex,
+                version=expected_version + 1,
+                action_type="confirm_delete",
+                target_transaction_id=target_transaction_id,
+                snapshot_transaction_id=None,
+                snapshot_transaction_type=None,
+                snapshot_amount_satang=None,
+                snapshot_category=None,
+                snapshot_description=None,
+                snapshot_occurred_on=None,
+                snapshot_created_at=None,
+                created_at=current_time,
+                expires_at=current_time + CONFIRM_DELETE_TTL,
+            )
+        )
+        db.flush()
+        return result.rowcount == 1
+
+
+def restore_deleted_transaction(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> RestoreResult:
+    """Consume an exact ``undo_delete`` and restore its snapshot verbatim.
+
+    The action is consumed conditionally; the row is reinserted under its exact
+    original id inside a nested savepoint.  An id collision rolls back only the
+    insert while leaving the action consumed, yielding a deterministic
+    ``ID_COLLISION`` outcome.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+
+    with _session_context(session) as db:
+        action = db.scalar(
+            select(PendingAction).where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "undo_delete",
+                PendingAction.expires_at > current_time,
+            )
+        )
+        if action is None:
+            raise PendingActionConflictError(
+                "pending action changed during undo"
+            )
+        if (
+            action.snapshot_transaction_id is None
+            or action.snapshot_transaction_type is None
+            or action.snapshot_amount_satang is None
+            or action.snapshot_category is None
+            or action.snapshot_occurred_on is None
+            or action.snapshot_created_at is None
+        ):
+            raise PendingActionConflictError("undo snapshot is incomplete")
+
+        consumed = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "undo_delete",
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        if consumed.rowcount == 0:
+            raise PendingActionConflictError(
+                "pending action changed during undo"
+            )
+        db.expunge(action)
+
+        values = {
+            "id": action.snapshot_transaction_id,
+            "line_user_id": user_id,
+            "transaction_type": action.snapshot_transaction_type,
+            "amount_satang": action.snapshot_amount_satang,
+            "category": action.snapshot_category,
+            "description": action.snapshot_description,
+            "occurred_on": action.snapshot_occurred_on,
+            "created_at": action.snapshot_created_at,
+        }
+        restored = Transaction(**values)
+        try:
+            with db.begin_nested():
+                db.add(restored)
+                db.flush()
+        except IntegrityError:
+            return RestoreResult(RestoreOutcome.ID_COLLISION)
+        return RestoreResult(RestoreOutcome.RESTORED, restored)
 
 
 def get_latest_transaction(

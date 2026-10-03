@@ -16,9 +16,10 @@ from sqlalchemy.orm import Session
 from database import init_db, session_scope
 from line_api import LineAPIError, reply_text, verify_webhook_signature
 from messages import (
-    format_buddhist_date,
     format_buddhist_month,
     format_delete_confirmation_prompt,
+    format_delete_not_confirmed_yet,
+    format_delete_success,
     format_edit_confirmation,
     format_help_message,
     format_monthly_summary,
@@ -28,6 +29,10 @@ from messages import (
     format_recent_transactions,
     format_savings_goal,
     format_transaction_confirmation,
+    format_undo_expired,
+    format_undo_id_collision,
+    format_undo_restored,
+    format_undo_unavailable,
     format_unknown_message,
 )
 from parser import (
@@ -48,6 +53,7 @@ from repository import (
     PendingActionConflictError,
     PendingActionState,
     PendingTransactionConflictError,
+    RestoreOutcome,
     add_savings_progress,
     add_transaction,
     confirm_delete_transaction,
@@ -64,6 +70,8 @@ from repository import (
     mark_webhook_processed,
     mark_webhook_replied,
     monthly_summary,
+    replace_pending_action_with_confirm,
+    restore_deleted_transaction,
     set_savings_goal,
     set_webhook_response,
     invalidate_pending_action,
@@ -160,13 +168,24 @@ def handle_text_message(
     except PendingActionConflictError:
         return PENDING_ACTION_RETRY_REPLY
 
-    if (
-        action_result.state == PendingActionState.EXPIRED_CLEANED
-        and normalized_text in {"ยืนยัน", "ยกเลิก"}
-    ):
-        return PENDING_ACTION_EXPIRED_REPLY
-
     action = action_result.action
+    action_type = (
+        action.action_type if action is not None else action_result.action_type
+    )
+    pending_confirm = (
+        action
+        if action is not None and action.action_type == "confirm_delete"
+        else None
+    )
+
+    if action_result.state == PendingActionState.EXPIRED_CLEANED:
+        if normalized_text in {"ยืนยัน", "ยกเลิก"} and action_type == "confirm_delete":
+            return PENDING_ACTION_EXPIRED_REPLY
+        if normalized_text == "เลิกทำ":
+            if action_type == "undo_delete":
+                return format_undo_expired()
+            return format_undo_unavailable()
+
     if action is not None and action.action_type == "confirm_delete":
         if normalized_text == "ยืนยัน":
             try:
@@ -182,11 +201,7 @@ def handle_text_message(
                 return PENDING_ACTION_RETRY_REPLY
             if item is None:
                 return "ไม่พบรายการที่ต้องการลบ (อาจถูกลบไปแล้ว)"
-            return (
-                "🗑️ ลบรายการเรียบร้อยแล้ว\n"
-                f"{item.category} · {item.amount:,.2f} บาท · "
-                f"{format_buddhist_date(item.occurred_on)}"
-            ).replace(".00 บาท", " บาท")
+            return format_delete_success(_transaction_data(item))
         if normalized_text == "ยกเลิก":
             if not delete_pending_action(
                 line_user_id,
@@ -197,6 +212,30 @@ def handle_text_message(
             ):
                 return PENDING_ACTION_RETRY_REPLY
             return "ยกเลิกการลบแล้ว"
+        if normalized_text == "เลิกทำ":
+            return format_delete_not_confirmed_yet()
+
+    if action is not None and action.action_type == "undo_delete":
+        if normalized_text == "เลิกทำ":
+            try:
+                outcome = restore_deleted_transaction(
+                    line_user_id,
+                    action.version,
+                    expected_action_id=action.action_id,
+                    now=_utc_now(),
+                    session=session,
+                )
+            except PendingActionConflictError:
+                return PENDING_ACTION_RETRY_REPLY
+            if outcome.outcome == RestoreOutcome.ID_COLLISION:
+                return format_undo_id_collision()
+            assert outcome.transaction is not None
+            return format_undo_restored(_transaction_data(outcome.transaction))
+        if normalized_text == "ยืนยัน":
+            return format_unknown_message()
+
+    if normalized_text == "เลิกทำ":
+        return format_undo_unavailable()
 
     try:
         pending = get_pending_transaction(
@@ -223,10 +262,10 @@ def handle_text_message(
         return format_unknown_message(command.reason)
 
     if isinstance(command, EditLatestCommand):
-        if action is not None and not invalidate_pending_action(
+        if pending_confirm is not None and not invalidate_pending_action(
             line_user_id,
-            action.version,
-            expected_action_id=action.action_id,
+            pending_confirm.version,
+            expected_action_id=pending_confirm.action_id,
             now=_utc_now(),
             session=session,
         ):
@@ -251,16 +290,16 @@ def handle_text_message(
         return format_edit_confirmation(_transaction_data(item))
 
     if pending is not None and isinstance(command, TransactionCommand):
-        if action is not None:
+        if pending_confirm is not None:
             if not invalidate_pending_action(
                 line_user_id,
-                action.version,
-                expected_action_id=action.action_id,
+                pending_confirm.version,
+                expected_action_id=pending_confirm.action_id,
                 now=_utc_now(),
                 session=session,
             ):
                 return PENDING_ACTION_RETRY_REPLY
-            action = None
+            pending_confirm = None
         if not delete_pending_transaction(
             line_user_id,
             pending.version,
@@ -284,16 +323,16 @@ def handle_text_message(
         )
         followup = parse_followup(draft, text, now=event_time)
         if isinstance(followup, TransactionCommand):
-            if action is not None:
+            if pending_confirm is not None:
                 if not invalidate_pending_action(
                     line_user_id,
-                    action.version,
-                    expected_action_id=action.action_id,
+                    pending_confirm.version,
+                    expected_action_id=pending_confirm.action_id,
                     now=_utc_now(),
                     session=session,
                 ):
                     return PENDING_ACTION_RETRY_REPLY
-                action = None
+                pending_confirm = None
             if not delete_pending_transaction(
                 line_user_id,
                 pending.version,
@@ -345,10 +384,10 @@ def handle_text_message(
         )
 
     if isinstance(command, TransactionCommand):
-        if action is not None and not invalidate_pending_action(
+        if pending_confirm is not None and not invalidate_pending_action(
             line_user_id,
-            action.version,
-            expected_action_id=action.action_id,
+            pending_confirm.version,
+            expected_action_id=pending_confirm.action_id,
             now=_utc_now(),
             session=session,
         ):
@@ -400,15 +439,29 @@ def handle_text_message(
         return format_recent_transactions([_transaction_data(item) for item in items])
 
     if command.kind == CommandKind.DELETE_LATEST:
-        if action is not None and not invalidate_pending_action(
+        item = get_latest_transaction(line_user_id, session=session)
+        if action is not None and action.action_type == "undo_delete":
+            if item is None:
+                return "ยังไม่มีรายการให้ลบ"
+            if not replace_pending_action_with_confirm(
+                line_user_id,
+                action.version,
+                expected_action_id=action.action_id,
+                expected_action_type="undo_delete",
+                target_transaction_id=item.id,
+                now=_utc_now(),
+                session=session,
+            ):
+                return PENDING_ACTION_RETRY_REPLY
+            return format_delete_confirmation_prompt(_transaction_data(item))
+        if pending_confirm is not None and not invalidate_pending_action(
             line_user_id,
-            action.version,
-            expected_action_id=action.action_id,
+            pending_confirm.version,
+            expected_action_id=pending_confirm.action_id,
             now=_utc_now(),
             session=session,
         ):
             return PENDING_ACTION_RETRY_REPLY
-        item = get_latest_transaction(line_user_id, session=session)
         if item is None:
             return "ยังไม่มีรายการให้ลบ"
         if not create_pending_action(
