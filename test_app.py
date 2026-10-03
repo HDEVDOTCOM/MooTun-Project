@@ -64,3 +64,26 @@ def test_savings_goal_flow(db_session):
     )
     status = handle_text_message("U-test", "เป้าหมาย", moment, db_session)
     assert "100 / 1,500 บาท" in status
+
+
+def test_delete_all_requires_confirmation_and_wipes_user(db_session):
+    moment = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+    handle_text_message("U-test", "รับ 1000 ค่าขนม", moment, db_session)
+    handle_text_message("U-test", "จ่าย 120.50 อาหาร", moment, db_session)
+
+    prompt = handle_text_message("U-test", "ลบข้อมูลทั้งหมด", moment, db_session)
+    assert "ลบข้อมูลทั้งหมด" in prompt
+    assert "รายการ 2 รายการ" in prompt
+    assert monthly_summary("U-test", 2026, 9, session=db_session)["transaction_count"] == 2
+
+    confirmed = handle_text_message("U-test", "ยืนยัน", moment, db_session)
+    assert "ลบข้อมูลทั้งหมดเรียบร้อยแล้ว" in confirmed
+    assert monthly_summary("U-test", 2026, 9, session=db_session)["transaction_count"] == 0
+
+
+def test_delete_all_without_data_is_rejected(db_session):
+    moment = datetime(2026, 9, 14, 3, 0, tzinfo=timezone.utc)
+
+    reply = handle_text_message("U-empty", "ลบข้อมูลทั้งหมด", moment, db_session)
+
+    assert reply == "ไม่มีข้อมูลให้ลบครับ"

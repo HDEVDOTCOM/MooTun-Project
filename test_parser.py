@@ -406,6 +406,7 @@ class OtherCommandTests(unittest.TestCase):
             "ล่าสุด": CommandKind.RECENT,
             "สรุปเดือนนี้": CommandKind.MONTHLY_SUMMARY,
             "ลบล่าสุด": CommandKind.DELETE_LATEST,
+            "ลบข้อมูลทั้งหมด": CommandKind.DELETE_ALL,
             "เป้าหมาย": CommandKind.SAVINGS_STATUS,
             "เป้าหมายการออม": CommandKind.SAVINGS_STATUS,
             "ดูเป้าหมาย": CommandKind.SAVINGS_STATUS,

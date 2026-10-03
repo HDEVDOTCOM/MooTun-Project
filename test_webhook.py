@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 import app as app_module
 from database import configure_database
 from line_api import LineTransportError
-from models import PendingAction, PendingTransaction, ProcessedWebhookEvent, Transaction
+from models import (
+    PendingAction,
+    PendingTransaction,
+    ProcessedWebhookEvent,
+    SavingsGoal,
+    Transaction,
+)
 
 
 SECRET = "test-channel-secret"
@@ -1612,4 +1618,308 @@ def test_undo_occ_loser_is_cached_and_not_reinterpreted(webhook_client, monkeypa
         assert action is not None
         assert action.action_type == "undo_delete"
         event = session.get(ProcessedWebhookEvent, "evt-undo-occ")
+        assert event.response_text == retry_reply
+
+
+DELETE_ALL_EXPIRED_REPLY = (
+    "คำสั่งลบข้อมูลทั้งหมดหมดอายุแล้ว "
+    "กรุณาส่ง 'ลบข้อมูลทั้งหมด' อีกครั้งหากต้องการลบ"
+)
+
+
+def test_delete_all_without_data_is_rejected(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-empty", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    assert replies[-1][1] == "ไม่มีข้อมูลให้ลบครับ"
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+
+
+def test_delete_all_wipes_only_user_and_keeps_webhook_events(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-a1", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-a2", "U-alice", "BTS 47").status_code == 200
+    assert _post_text(client, "evt-da-draft", "U-alice", "กาแฟ").status_code == 200
+    assert _post_text(client, "evt-da-goal", "U-alice", "ตั้งเป้า 1500 ซื้อหนังสือ").status_code == 200
+    assert _post_text(client, "evt-da-b1", "U-bob", "เงินเดือน 20000").status_code == 200
+    assert _post_text(client, "evt-da-b2", "U-bob", "ตั้งเป้า 9000 โทรศัพท์").status_code == 200
+
+    assert _post_text(client, "evt-da-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    assert replies[-1][1].startswith("คุณกำลังจะลบข้อมูลทั้งหมด")
+    assert "รายการ 2 รายการ" in replies[-1][1]
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete_all"
+        assert action.target_transaction_id == 0
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 2
+        )
+
+    assert _post_text(client, "evt-da-confirm", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("🗑️ ลบข้อมูลทั้งหมดเรียบร้อยแล้ว")
+    with Session(engine) as session:
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 0
+        )
+        assert (
+            session.scalar(
+                select(func.count(SavingsGoal.id)).where(
+                    SavingsGoal.line_user_id == "U-alice"
+                )
+            )
+            == 0
+        )
+        assert session.get(PendingTransaction, "U-alice") is None
+        assert session.get(PendingAction, "U-alice") is None
+
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-bob"
+                )
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count(SavingsGoal.id)).where(
+                    SavingsGoal.line_user_id == "U-bob"
+                )
+            )
+            == 1
+        )
+
+        assert session.get(ProcessedWebhookEvent, "evt-da-request") is not None
+        assert session.get(ProcessedWebhookEvent, "evt-da-confirm") is not None
+        assert session.get(ProcessedWebhookEvent, "evt-da-b1") is not None
+
+
+def test_delete_all_trigger_and_confirm_redelivery_are_idempotent(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-idem-seed", "U-alice", "ข้าว 40").status_code == 200
+
+    trigger_body, trigger_headers = _signed_body(
+        {"events": [_text_event("evt-da-idem-trigger", "U-alice", "ลบข้อมูลทั้งหมด")]}
+    )
+    for _ in range(2):
+        assert client.post("/webhook", content=trigger_body, headers=trigger_headers).status_code == 200
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete_all"
+    assert [reply[0] for reply in replies].count("reply-evt-da-idem-trigger") == 1
+
+    confirm_body, confirm_headers = _signed_body(
+        {"events": [_text_event("evt-da-idem-confirm", "U-alice", "ยืนยัน")]}
+    )
+    for _ in range(2):
+        assert client.post("/webhook", content=confirm_body, headers=confirm_headers).status_code == 200
+    with Session(engine) as session:
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 0
+        )
+        assert session.get(PendingAction, "U-alice") is None
+    assert [reply[0] for reply in replies].count("reply-evt-da-idem-confirm") == 1
+
+
+def test_delete_all_cancel_preserves_draft_and_financial_data(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-cancel-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-cancel-draft", "U-alice", "กาแฟ").status_code == 200
+    assert _post_text(client, "evt-da-cancel-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    assert replies[-1][1].startswith("คุณกำลังจะลบข้อมูลทั้งหมด")
+    with Session(engine) as session:
+        pending = session.get(PendingTransaction, "U-alice")
+        pending_state = _row_state(pending)
+
+    assert _post_text(client, "evt-da-cancel", "U-alice", "ยกเลิก").status_code == 200
+    assert replies[-1][1] == "ยกเลิกการลบข้อมูลทั้งหมดแล้ว"
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        pending = session.get(PendingTransaction, "U-alice")
+        assert pending is not None
+        assert _row_state(pending) == pending_state
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 1
+        )
+
+
+def test_delete_all_overrides_active_undo(webhook_client):
+    client, engine, replies = webhook_client
+    _create_undo_snapshot(client, engine)
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice").action_type == "undo_delete"
+
+    assert _post_text(client, "evt-da-override-undo", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    assert replies[-1][1].startswith("คุณกำลังจะลบข้อมูลทั้งหมด")
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action.action_type == "confirm_delete_all"
+        assert action.target_transaction_id == 0
+        assert action.snapshot_transaction_id is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+    assert _post_text(client, "evt-da-override-confirm", "U-alice", "ยืนยัน").status_code == 200
+    assert replies[-1][1].startswith("🗑️ ลบข้อมูลทั้งหมดเรียบร้อยแล้ว")
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert session.scalar(select(func.count(Transaction.id))) == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_descriptions"),
+    [
+        ("BTS 47", ["ข้าว", "BTS"]),
+        ("แก้ ข้าว 60", ["ข้าว"]),
+    ],
+)
+def test_transaction_mutation_invalidates_delete_all(
+    webhook_client,
+    mutation,
+    expected_descriptions,
+):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-da-invalidate-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-invalidate-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+
+    assert _post_text(client, "evt-da-invalidate-mutation", "U-alice", mutation).status_code == 200
+
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        items = list(session.scalars(select(Transaction).order_by(Transaction.id)))
+        assert [item.description for item in items] == expected_descriptions
+
+
+def test_goal_mutation_invalidates_delete_all(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-goalinv-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-goalinv-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+
+    assert _post_text(
+        client, "evt-da-goalinv-set", "U-alice", "ตั้งเป้า 1500 ซื้อหนังสือ"
+    ).status_code == 200
+    assert replies[-1][1].startswith("ตั้งเป้าหมายเรียบร้อยแล้ว")
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert (
+            session.scalar(
+                select(func.count(SavingsGoal.id)).where(
+                    SavingsGoal.line_user_id == "U-alice"
+                )
+            )
+            == 1
+        )
+
+
+def test_delete_all_undo_command_reports_unavailable(webhook_client):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-undo-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-undo-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+
+    assert _post_text(client, "evt-da-undo", "U-alice", "เลิกทำ").status_code == 200
+    assert replies[-1][1] == UNDO_UNAVAILABLE_REPLY
+    with Session(engine) as session:
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete_all"
+
+
+@pytest.mark.parametrize("control", ["ยกเลิก", "ยืนยัน"])
+def test_expired_delete_all_control_reports_expiry(webhook_client, control):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-exp-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-exp-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    _expire_pending_action(engine)
+
+    assert _post_text(
+        client, f"evt-da-exp-{control}", "U-alice", control
+    ).status_code == 200
+    assert replies[-1][1] == DELETE_ALL_EXPIRED_REPLY
+    with Session(engine) as session:
+        assert session.get(PendingAction, "U-alice") is None
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 1
+        )
+
+
+def test_repeated_delete_all_resets_action(webhook_client):
+    client, engine, _ = webhook_client
+    assert _post_text(client, "evt-da-repeat-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-repeat-1", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    with Session(engine) as session:
+        first = session.get(PendingAction, "U-alice")
+        first_action_id = first.action_id
+        first_version = first.version
+        assert first.action_type == "confirm_delete_all"
+
+    assert _post_text(client, "evt-da-repeat-2", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    with Session(engine) as session:
+        second = session.get(PendingAction, "U-alice")
+        assert second.action_id != first_action_id
+        assert second.version == first_version + 1
+        assert second.action_type == "confirm_delete_all"
+        assert second.target_transaction_id == 0
+
+
+def test_delete_all_occ_loser_reply_is_cached(webhook_client, monkeypatch):
+    client, engine, replies = webhook_client
+    assert _post_text(client, "evt-da-occ-seed", "U-alice", "ข้าว 40").status_code == 200
+    assert _post_text(client, "evt-da-occ-request", "U-alice", "ลบข้อมูลทั้งหมด").status_code == 200
+    calls = 0
+
+    def lose_execute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise app_module.PendingActionConflictError("simulated delete-all race")
+
+    monkeypatch.setattr(app_module, "execute_delete_all", lose_execute)
+    body, headers = _signed_body(
+        {"events": [_text_event("evt-da-occ-confirm", "U-alice", "ยืนยัน")]}
+    )
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    retry_reply = "รายการที่ค้างอยู่มีการเปลี่ยนแปลงแล้วครับ กรุณาลองส่งอีกครั้ง"
+    assert replies[-1][1] == retry_reply
+    assert calls == 1
+
+    assert client.post("/webhook", content=body, headers=headers).status_code == 200
+    assert calls == 1
+    with Session(engine) as session:
+        assert (
+            session.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == "U-alice"
+                )
+            )
+            == 1
+        )
+        action = session.get(PendingAction, "U-alice")
+        assert action is not None
+        assert action.action_type == "confirm_delete_all"
+        event = session.get(ProcessedWebhookEvent, "evt-da-occ-confirm")
         assert event.response_text == retry_reply

@@ -5,9 +5,17 @@ import pytest
 from sqlalchemy import create_engine, delete, inspect, insert, select, text, update
 from sqlalchemy.orm import Session
 
-from models import Base, PendingAction, PendingTransaction, Transaction
+from models import (
+    Base,
+    PendingAction,
+    PendingTransaction,
+    ProcessedWebhookEvent,
+    Transaction,
+)
 from database import init_db
 from repository import (
+    CONFIRM_DELETE_ALL_TTL,
+    DELETE_ALL_TARGET_SENTINEL,
     PENDING_ACTION_TTL,
     UNDO_DELETE_TTL,
     PendingActionConflictError,
@@ -23,15 +31,19 @@ from repository import (
     delete_latest_transaction,
     delete_pending_action,
     delete_pending_transaction,
+    execute_delete_all,
     get_latest_transaction,
     get_pending_action,
     get_savings_goal,
     get_pending_transaction,
+    get_user_data_summary,
     get_webhook_event,
+    invalidate_pending_action,
     list_recent_transactions,
     mark_webhook_processed,
     mark_webhook_replied,
     monthly_summary,
+    replace_pending_action_with_delete_all,
     restore_deleted_transaction,
     set_savings_goal,
     set_webhook_response,
@@ -1037,3 +1049,262 @@ def test_restore_deleted_transaction_round_trip_and_id_collision(db_session):
     db_session.expire_all()
     assert db_session.get(PendingAction, "U-alice") is None
     assert db_session.get(Transaction, snapshot_id).description == "ทับซ้อน"
+
+
+def test_create_delete_all_action_uses_sentinel_and_ttl(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete_all",
+        target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    assert action.action_type == "confirm_delete_all"
+    assert action.target_transaction_id == 0
+    assert action.expires_at.replace(tzinfo=timezone.utc) == (
+        now + CONFIRM_DELETE_ALL_TTL
+    )
+
+    with pytest.raises(ValueError):
+        create_pending_action(
+            "U-bob",
+            action_type="confirm_delete_all",
+            target_transaction_id=5,
+            now=now,
+            session=db_session,
+        )
+    with pytest.raises(ValueError):
+        create_pending_action(
+            "U-bob",
+            action_type="unknown",
+            target_transaction_id=1,
+            now=now,
+            session=db_session,
+        )
+
+
+def test_execute_delete_all_wipes_only_requesting_user(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+    add_transaction("U-alice", "income", "100", "ค่าขนม", session=db_session)
+    add_transaction("U-bob", "expense", "70", "อาหาร", session=db_session)
+    set_savings_goal("U-alice", "ซื้อหนังสือ", "1500", session=db_session)
+    set_savings_goal("U-bob", "โทรศัพท์", "9000", session=db_session)
+    assert create_pending_transaction(
+        "U-alice",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 23),
+        now=now,
+        session=db_session,
+    )
+    assert create_pending_transaction(
+        "U-bob",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 23),
+        now=now,
+        session=db_session,
+    )
+    assert mark_webhook_processed("evt-alice", session=db_session)
+    assert mark_webhook_processed("evt-bob", session=db_session)
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete_all",
+        target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+
+    execute_delete_all(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        now=now,
+        session=db_session,
+    )
+
+    db_session.expire_all()
+    assert list_recent_transactions("U-alice", session=db_session) == []
+    assert get_savings_goal("U-alice", session=db_session) is None
+    assert get_pending_transaction("U-alice", now=now, session=db_session) is None
+    assert db_session.get(PendingAction, "U-alice") is None
+
+    assert len(list_recent_transactions("U-bob", session=db_session)) == 1
+    assert get_savings_goal("U-bob", session=db_session) is not None
+    assert get_pending_transaction("U-bob", now=now, session=db_session) is not None
+
+    assert db_session.get(ProcessedWebhookEvent, "evt-alice") is not None
+    assert db_session.get(ProcessedWebhookEvent, "evt-bob") is not None
+
+
+def test_execute_delete_all_occ_loser_preserves_data(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete_all",
+        target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+
+    with pytest.raises(PendingActionConflictError):
+        execute_delete_all(
+            "U-alice",
+            action.version + 1,
+            expected_action_id=action.action_id,
+            now=now,
+            session=db_session,
+        )
+    with pytest.raises(PendingActionConflictError):
+        execute_delete_all(
+            "U-bob",
+            action.version,
+            expected_action_id=action.action_id,
+            now=now,
+            session=db_session,
+        )
+
+    db_session.expire_all()
+    assert len(list_recent_transactions("U-alice", session=db_session)) == 1
+    assert db_session.get(PendingAction, "U-alice") is not None
+
+
+def test_invalidate_pending_action_drops_both_confirmations(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+    assert invalidate_pending_action(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        now=now,
+        session=db_session,
+    )
+    db_session.expire_all()
+    assert db_session.get(PendingAction, "U-alice") is None
+
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete_all",
+        target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+    assert invalidate_pending_action(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        now=now,
+        session=db_session,
+    )
+    db_session.expire_all()
+    assert db_session.get(PendingAction, "U-alice") is None
+
+
+def test_replace_pending_action_with_delete_all_widens_undo_scope(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+    target = add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+    assert create_pending_action(
+        "U-alice",
+        action_type="confirm_delete",
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    )
+    action = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(action)
+    assert confirm_delete_transaction(
+        "U-alice",
+        action.version,
+        expected_action_id=action.action_id,
+        target_transaction_id=target.id,
+        now=now,
+        session=db_session,
+    ) is not None
+
+    undo = db_session.get(PendingAction, "U-alice")
+    db_session.refresh(undo)
+    assert undo.action_type == "undo_delete"
+    assert replace_pending_action_with_delete_all(
+        "U-alice",
+        undo.version,
+        expected_action_id=undo.action_id,
+        expected_action_type="undo_delete",
+        now=now,
+        session=db_session,
+    )
+    db_session.expire_all()
+    replaced = db_session.get(PendingAction, "U-alice")
+    assert replaced.action_type == "confirm_delete_all"
+    assert replaced.target_transaction_id == DELETE_ALL_TARGET_SENTINEL
+    assert replaced.snapshot_transaction_id is None
+    assert replaced.snapshot_created_at is None
+    assert replaced.expires_at.replace(tzinfo=timezone.utc) == (
+        now + CONFIRM_DELETE_ALL_TTL
+    )
+
+
+def test_get_user_data_summary_reports_each_data_source(db_session):
+    now = datetime(2026, 9, 23, 3, 0, tzinfo=timezone.utc)
+
+    assert not get_user_data_summary("U-alice", session=db_session).has_any_data
+
+    add_transaction("U-alice", "expense", "50", "อาหาร", session=db_session)
+    transaction_summary = get_user_data_summary("U-alice", session=db_session)
+    assert transaction_summary.transaction_count == 1
+    assert transaction_summary.has_any_data
+
+    set_savings_goal("U-alice", "ซื้อหนังสือ", "1500", session=db_session)
+    assert get_user_data_summary(
+        "U-bob", session=db_session
+    ).has_any_data is False
+    assert get_user_data_summary("U-alice", session=db_session).has_savings_goal
+
+    assert create_pending_transaction(
+        "U-carol",
+        transaction_type=None,
+        amount="500",
+        category=None,
+        description=None,
+        occurred_on=date(2026, 9, 23),
+        now=now,
+        session=db_session,
+    )
+    carol_summary = get_user_data_summary("U-carol", session=db_session)
+    assert carol_summary.has_pending_transaction
+    assert carol_summary.has_any_data
+
+    assert create_pending_action(
+        "U-dave",
+        action_type="confirm_delete_all",
+        target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+        now=now,
+        session=db_session,
+    )
+    dave_summary = get_user_data_summary("U-dave", session=db_session)
+    assert dave_summary.has_pending_action
+    assert dave_summary.has_any_data

@@ -2,6 +2,8 @@ from datetime import date
 
 from messages import (
     format_amount,
+    format_delete_all_confirmation_prompt,
+    format_delete_all_success,
     format_delete_confirmation_prompt,
     format_edit_confirmation,
     format_help_message,
@@ -73,6 +75,25 @@ def test_delete_confirmation_prompt_identifies_exact_target() -> None:
     assert "หมวด: อาหาร" in message
     assert "วันที่: 21/09/2569" in message
     assert 'พิมพ์ "ยืนยัน"' in message
+
+
+def test_delete_all_prompt_states_scope_and_irreversibility() -> None:
+    message = format_delete_all_confirmation_prompt(3)
+
+    assert "ลบข้อมูลทั้งหมด" in message
+    assert "รายการ 3 รายการ" in message
+    assert "เป้าหมายการออม" in message
+    assert "ไม่สามารถย้อนกลับได้" in message
+    assert "บันทึกของระบบบางส่วนจะถูกคงไว้เพื่อป้องกันข้อผิดพลาด" in message
+    assert "ชั่วคราว" not in message
+    assert "ยืนยัน" in message
+    assert "ยกเลิก" in message
+
+
+def test_delete_all_success_does_not_offer_undo() -> None:
+    message = format_delete_all_success()
+    assert "ลบข้อมูลทั้งหมดเรียบร้อยแล้ว" in message
+    assert "เลิกทำ" not in message
 
 
 def test_recent_transactions_handles_empty_and_mixed_items() -> None:

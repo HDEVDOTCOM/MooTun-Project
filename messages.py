@@ -145,6 +145,42 @@ def format_delete_success(transaction: Mapping[str, object]) -> str:
     )
 
 
+def format_delete_all_confirmation_prompt(transaction_count: int) -> str:
+    """Warn before irreversibly erasing every piece of the user's data."""
+
+    return limit_line_text(
+        "คุณกำลังจะลบข้อมูลทั้งหมด "
+        f"(รายการ {transaction_count:,} รายการ, เป้าหมายการออม และสถานะที่ค้างอยู่)\n"
+        "การกระทำนี้ไม่สามารถย้อนกลับได้ "
+        "(บันทึกของระบบบางส่วนจะถูกคงไว้เพื่อป้องกันข้อผิดพลาด)\n\n"
+        "พิมพ์ 'ยืนยัน' เพื่อลบ หรือ 'ยกเลิก' เพื่อกลับไปหน้าปกติ"
+    )
+
+
+def format_delete_all_success() -> str:
+    """Confirm a completed total wipe without advertising an undo window."""
+
+    return limit_line_text(
+        "🗑️ ลบข้อมูลทั้งหมดเรียบร้อยแล้ว\n"
+        "ระบบได้ลบรายการ เป้าหมายการออม และสถานะที่ค้างอยู่ของคุณทั้งหมด"
+    )
+
+
+def format_delete_all_cancelled() -> str:
+    return "ยกเลิกการลบข้อมูลทั้งหมดแล้ว"
+
+
+def format_delete_all_no_data() -> str:
+    return "ไม่มีข้อมูลให้ลบครับ"
+
+
+def format_delete_all_expired() -> str:
+    return (
+        "คำสั่งลบข้อมูลทั้งหมดหมดอายุแล้ว "
+        "กรุณาส่ง 'ลบข้อมูลทั้งหมด' อีกครั้งหากต้องการลบ"
+    )
+
+
 def format_undo_restored(transaction: Mapping[str, object]) -> str:
     """Confirm that a deleted transaction was restored from its snapshot."""
 
@@ -308,6 +344,7 @@ def format_help_message() -> str:
         "ดูสรุป: สรุปเดือนนี้\n"
         "ลบรายการ: ลบล่าสุด (ต้องยืนยันก่อนลบ)\n"
         "ย้อนกลับการลบ: เลิกทำ (ภายใน 10 นาที)\n"
+        "ลบข้อมูลทั้งหมด: ลบข้อมูลทั้งหมด (ต้องยืนยัน)\n"
         "แก้ไขรายการล่าสุด: แก้ไข ข้าว 60\n"
         "ตั้งเป้าหมาย: ตั้งเป้า 1500 ซื้อหนังสือ\n"
         "เพิ่มเงินออม: ออม 100\n"

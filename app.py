@@ -17,6 +17,11 @@ from database import init_db, session_scope
 from line_api import LineAPIError, reply_text, verify_webhook_signature
 from messages import (
     format_buddhist_month,
+    format_delete_all_cancelled,
+    format_delete_all_confirmation_prompt,
+    format_delete_all_expired,
+    format_delete_all_no_data,
+    format_delete_all_success,
     format_delete_confirmation_prompt,
     format_delete_not_confirmed_yet,
     format_delete_success,
@@ -50,6 +55,7 @@ from parser import (
     parse_followup,
 )
 from repository import (
+    DELETE_ALL_TARGET_SENTINEL,
     PendingActionConflictError,
     PendingActionState,
     PendingTransactionConflictError,
@@ -61,16 +67,19 @@ from repository import (
     create_pending_transaction,
     delete_pending_action,
     delete_pending_transaction,
+    execute_delete_all,
     get_latest_transaction,
     get_pending_action,
     get_savings_goal,
     get_pending_transaction,
+    get_user_data_summary,
     get_webhook_event,
     list_recent_transactions,
     mark_webhook_processed,
     mark_webhook_replied,
     monthly_summary,
     replace_pending_action_with_confirm,
+    replace_pending_action_with_delete_all,
     restore_deleted_transaction,
     set_savings_goal,
     set_webhook_response,
@@ -172,15 +181,26 @@ def handle_text_message(
     action_type = (
         action.action_type if action is not None else action_result.action_type
     )
-    pending_confirm = (
+    pending_delete_confirmation = (
         action
-        if action is not None and action.action_type == "confirm_delete"
+        if action is not None
+        and action.action_type in {"confirm_delete", "confirm_delete_all"}
+        else None
+    )
+    pending_delete_all = (
+        action
+        if action is not None and action.action_type == "confirm_delete_all"
         else None
     )
 
     if action_result.state == PendingActionState.EXPIRED_CLEANED:
         if normalized_text in {"ยืนยัน", "ยกเลิก"} and action_type == "confirm_delete":
             return PENDING_ACTION_EXPIRED_REPLY
+        if (
+            normalized_text in {"ยืนยัน", "ยกเลิก"}
+            and action_type == "confirm_delete_all"
+        ):
+            return format_delete_all_expired()
         if normalized_text == "เลิกทำ":
             if action_type == "undo_delete":
                 return format_undo_expired()
@@ -214,6 +234,32 @@ def handle_text_message(
             return "ยกเลิกการลบแล้ว"
         if normalized_text == "เลิกทำ":
             return format_delete_not_confirmed_yet()
+
+    if action is not None and action.action_type == "confirm_delete_all":
+        if normalized_text == "ยืนยัน":
+            try:
+                execute_delete_all(
+                    line_user_id,
+                    action.version,
+                    expected_action_id=action.action_id,
+                    now=_utc_now(),
+                    session=session,
+                )
+            except PendingActionConflictError:
+                return PENDING_ACTION_RETRY_REPLY
+            return format_delete_all_success()
+        if normalized_text == "ยกเลิก":
+            if not delete_pending_action(
+                line_user_id,
+                action.version,
+                expected_action_id=action.action_id,
+                now=_utc_now(),
+                session=session,
+            ):
+                return PENDING_ACTION_RETRY_REPLY
+            return format_delete_all_cancelled()
+        if normalized_text == "เลิกทำ":
+            return format_undo_unavailable()
 
     if action is not None and action.action_type == "undo_delete":
         if normalized_text == "เลิกทำ":
@@ -262,10 +308,10 @@ def handle_text_message(
         return format_unknown_message(command.reason)
 
     if isinstance(command, EditLatestCommand):
-        if pending_confirm is not None and not invalidate_pending_action(
+        if pending_delete_confirmation is not None and not invalidate_pending_action(
             line_user_id,
-            pending_confirm.version,
-            expected_action_id=pending_confirm.action_id,
+            pending_delete_confirmation.version,
+            expected_action_id=pending_delete_confirmation.action_id,
             now=_utc_now(),
             session=session,
         ):
@@ -290,16 +336,16 @@ def handle_text_message(
         return format_edit_confirmation(_transaction_data(item))
 
     if pending is not None and isinstance(command, TransactionCommand):
-        if pending_confirm is not None:
+        if pending_delete_confirmation is not None:
             if not invalidate_pending_action(
                 line_user_id,
-                pending_confirm.version,
-                expected_action_id=pending_confirm.action_id,
+                pending_delete_confirmation.version,
+                expected_action_id=pending_delete_confirmation.action_id,
                 now=_utc_now(),
                 session=session,
             ):
                 return PENDING_ACTION_RETRY_REPLY
-            pending_confirm = None
+            pending_delete_confirmation = None
         if not delete_pending_transaction(
             line_user_id,
             pending.version,
@@ -323,16 +369,16 @@ def handle_text_message(
         )
         followup = parse_followup(draft, text, now=event_time)
         if isinstance(followup, TransactionCommand):
-            if pending_confirm is not None:
+            if pending_delete_confirmation is not None:
                 if not invalidate_pending_action(
                     line_user_id,
-                    pending_confirm.version,
-                    expected_action_id=pending_confirm.action_id,
+                    pending_delete_confirmation.version,
+                    expected_action_id=pending_delete_confirmation.action_id,
                     now=_utc_now(),
                     session=session,
                 ):
                     return PENDING_ACTION_RETRY_REPLY
-                pending_confirm = None
+                pending_delete_confirmation = None
             if not delete_pending_transaction(
                 line_user_id,
                 pending.version,
@@ -384,10 +430,10 @@ def handle_text_message(
         )
 
     if isinstance(command, TransactionCommand):
-        if pending_confirm is not None and not invalidate_pending_action(
+        if pending_delete_confirmation is not None and not invalidate_pending_action(
             line_user_id,
-            pending_confirm.version,
-            expected_action_id=pending_confirm.action_id,
+            pending_delete_confirmation.version,
+            expected_action_id=pending_delete_confirmation.action_id,
             now=_utc_now(),
             session=session,
         ):
@@ -404,6 +450,14 @@ def handle_text_message(
         return format_transaction_confirmation(_transaction_data(item))
 
     if isinstance(command, SavingsGoalCommand):
+        if pending_delete_all is not None and not invalidate_pending_action(
+            line_user_id,
+            pending_delete_all.version,
+            expected_action_id=pending_delete_all.action_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
         goal = set_savings_goal(
             line_user_id,
             command.description or "เป้าหมายการออม",
@@ -413,6 +467,14 @@ def handle_text_message(
         return "ตั้งเป้าหมายเรียบร้อยแล้ว\n" + format_savings_goal(_goal_data(goal))
 
     if isinstance(command, SavingsProgressCommand):
+        if pending_delete_all is not None and not invalidate_pending_action(
+            line_user_id,
+            pending_delete_all.version,
+            expected_action_id=pending_delete_all.action_id,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
         try:
             goal = add_savings_progress(
                 line_user_id,
@@ -438,6 +500,30 @@ def handle_text_message(
         items = list_recent_transactions(line_user_id, limit=5, session=session)
         return format_recent_transactions([_transaction_data(item) for item in items])
 
+    if command.kind == CommandKind.DELETE_ALL:
+        summary = get_user_data_summary(line_user_id, session=session)
+        if not summary.has_any_data:
+            return format_delete_all_no_data()
+        if action is not None:
+            if not replace_pending_action_with_delete_all(
+                line_user_id,
+                action.version,
+                expected_action_id=action.action_id,
+                expected_action_type=action.action_type,
+                now=_utc_now(),
+                session=session,
+            ):
+                return PENDING_ACTION_RETRY_REPLY
+        elif not create_pending_action(
+            line_user_id,
+            action_type="confirm_delete_all",
+            target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+            now=_utc_now(),
+            session=session,
+        ):
+            return PENDING_ACTION_RETRY_REPLY
+        return format_delete_all_confirmation_prompt(summary.transaction_count)
+
     if command.kind == CommandKind.DELETE_LATEST:
         item = get_latest_transaction(line_user_id, session=session)
         if action is not None and action.action_type == "undo_delete":
@@ -454,10 +540,10 @@ def handle_text_message(
             ):
                 return PENDING_ACTION_RETRY_REPLY
             return format_delete_confirmation_prompt(_transaction_data(item))
-        if pending_confirm is not None and not invalidate_pending_action(
+        if pending_delete_confirmation is not None and not invalidate_pending_action(
             line_user_id,
-            pending_confirm.version,
-            expected_action_id=pending_confirm.action_id,
+            pending_delete_confirmation.version,
+            expected_action_id=pending_delete_confirmation.action_id,
             now=_utc_now(),
             session=session,
         ):

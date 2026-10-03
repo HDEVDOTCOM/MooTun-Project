@@ -35,7 +35,14 @@ MoneyInput = Decimal | int | str
 PENDING_TRANSACTION_TTL = timedelta(hours=1)
 PENDING_ACTION_TTL = timedelta(minutes=10)
 CONFIRM_DELETE_TTL = timedelta(minutes=10)
+CONFIRM_DELETE_ALL_TTL = timedelta(minutes=10)
 UNDO_DELETE_TTL = timedelta(minutes=10)
+
+# ``PendingAction.target_transaction_id`` is a non-nullable INTEGER with no
+# positive-only constraint.  Delete-all has no single target, so it uses this
+# reserved sentinel.  SQLite/Postgres auto-increment IDs start at 1, leaving 0
+# permanently safe and avoiding an ``ALTER COLUMN`` rebuild.
+DELETE_ALL_TARGET_SENTINEL = 0
 
 
 class PendingTransactionConflictError(RuntimeError):
@@ -68,6 +75,25 @@ class PendingActionResult:
 class RestoreResult:
     outcome: RestoreOutcome
     transaction: Transaction | None = None
+
+
+@dataclass(frozen=True)
+class UserDataSummary:
+    """Everything the delete-all feature must account for, per user."""
+
+    transaction_count: int
+    has_savings_goal: bool
+    has_pending_transaction: bool
+    has_pending_action: bool
+
+    @property
+    def has_any_data(self) -> bool:
+        return (
+            self.transaction_count > 0
+            or self.has_savings_goal
+            or self.has_pending_transaction
+            or self.has_pending_action
+        )
 
 
 def baht_to_satang(amount: MoneyInput) -> int:
@@ -545,10 +571,18 @@ def create_pending_action(
     """Create one pending action; first successful concurrent create wins."""
 
     user_id = _validate_user_id(line_user_id)
-    if action_type != "confirm_delete":
-        raise ValueError("action_type must be 'confirm_delete'")
-    if target_transaction_id < 1:
-        raise ValueError("target_transaction_id must be positive")
+    if action_type == "confirm_delete":
+        if target_transaction_id < 1:
+            raise ValueError("target_transaction_id must be positive")
+        ttl = PENDING_ACTION_TTL
+    elif action_type == "confirm_delete_all":
+        if target_transaction_id != DELETE_ALL_TARGET_SENTINEL:
+            raise ValueError("confirm_delete_all requires the delete-all sentinel")
+        ttl = CONFIRM_DELETE_ALL_TTL
+    else:
+        raise ValueError(
+            "action_type must be 'confirm_delete' or 'confirm_delete_all'"
+        )
     current_time = now or datetime.now(timezone.utc)
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
@@ -559,7 +593,7 @@ def create_pending_action(
         "action_type": action_type,
         "target_transaction_id": target_transaction_id,
         "created_at": current_time,
-        "expires_at": current_time + PENDING_ACTION_TTL,
+        "expires_at": current_time + ttl,
     }
     with _session_context(session) as db:
         try:
@@ -608,11 +642,12 @@ def invalidate_pending_action(
     now: datetime | None = None,
     session: Session | None = None,
 ) -> bool:
-    """Discard an unrelated ``confirm_delete`` action.
+    """Discard an unrelated deletion confirmation action.
 
-    An active ``undo_delete`` snapshot is intentionally preserved: unrelated
-    transactions, edits, draft completions, and stateless commands must not
-    consume the user's pending undo opportunity.
+    Both ``confirm_delete`` and ``confirm_delete_all`` are dropped by unrelated
+    state mutations.  An active ``undo_delete`` snapshot is intentionally
+    preserved: unrelated transactions, edits, draft completions, and stateless
+    commands must not consume the user's pending undo opportunity.
     """
 
     user_id = _validate_user_id(line_user_id)
@@ -626,7 +661,9 @@ def invalidate_pending_action(
                 PendingAction.line_user_id == user_id,
                 PendingAction.action_id == expected_action_id,
                 PendingAction.version == expected_version,
-                PendingAction.action_type == "confirm_delete",
+                PendingAction.action_type.in_(
+                    ["confirm_delete", "confirm_delete_all"]
+                ),
                 PendingAction.expires_at > current_time,
             )
             .execution_options(synchronize_session=False)
@@ -785,6 +822,135 @@ def replace_pending_action_with_confirm(
         )
         db.flush()
         return result.rowcount == 1
+
+
+def replace_pending_action_with_delete_all(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    expected_action_type: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    """OCC-safely replace the current action with a fresh ``confirm_delete_all``.
+
+    Used when ``ลบข้อมูลทั้งหมด`` arrives while any other action (a single-delete
+    confirmation, an undo snapshot, or a previous delete-all) is active: the
+    stale action is intentionally discarded because a total wipe abandons it.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        result = db.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == expected_action_type,
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                action_id=uuid4().hex,
+                version=expected_version + 1,
+                action_type="confirm_delete_all",
+                target_transaction_id=DELETE_ALL_TARGET_SENTINEL,
+                snapshot_transaction_id=None,
+                snapshot_transaction_type=None,
+                snapshot_amount_satang=None,
+                snapshot_category=None,
+                snapshot_description=None,
+                snapshot_occurred_on=None,
+                snapshot_created_at=None,
+                created_at=current_time,
+                expires_at=current_time + CONFIRM_DELETE_ALL_TTL,
+            )
+        )
+        db.flush()
+        return result.rowcount == 1
+
+
+def execute_delete_all(
+    line_user_id: str,
+    expected_version: int,
+    *,
+    expected_action_id: str,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> None:
+    """Atomically consume an exact ``confirm_delete_all`` and wipe user data.
+
+    The confirmation row is deleted with identity/version/type/expiry OCC
+    guards.  Only when that succeeds are the user's transactions, savings goal,
+    pending draft, and any remaining action removed, all in the same
+    transaction and every statement scoped by ``line_user_id``.  Global
+    webhook-idempotency records are deliberately never touched.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    with _session_context(session) as db:
+        consumed = db.execute(
+            delete(PendingAction)
+            .where(
+                PendingAction.line_user_id == user_id,
+                PendingAction.action_id == expected_action_id,
+                PendingAction.version == expected_version,
+                PendingAction.action_type == "confirm_delete_all",
+                PendingAction.expires_at > current_time,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.flush()
+        if consumed.rowcount == 0:
+            raise PendingActionConflictError(
+                "pending action changed during delete-all"
+            )
+        for model in (PendingTransaction, SavingsGoal, Transaction):
+            db.execute(
+                delete(model)
+                .where(model.line_user_id == user_id)
+                .execution_options(synchronize_session=False)
+            )
+        db.flush()
+
+
+def get_user_data_summary(
+    line_user_id: str, *, session: Session | None = None
+) -> UserDataSummary:
+    """Report whether a user still has anything delete-all would remove."""
+
+    user_id = _validate_user_id(line_user_id)
+    with _session_context(session) as db:
+        transaction_count = int(
+            db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.line_user_id == user_id
+                )
+            )
+            or 0
+        )
+        has_goal = (
+            db.scalar(
+                select(SavingsGoal.id).where(SavingsGoal.line_user_id == user_id)
+            )
+            is not None
+        )
+        has_draft = db.get(PendingTransaction, user_id) is not None
+        has_action = db.get(PendingAction, user_id) is not None
+    return UserDataSummary(
+        transaction_count=transaction_count,
+        has_savings_goal=has_goal,
+        has_pending_transaction=has_draft,
+        has_pending_action=has_action,
+    )
 
 
 def restore_deleted_transaction(
