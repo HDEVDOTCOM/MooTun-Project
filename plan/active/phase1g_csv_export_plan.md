@@ -1,6 +1,6 @@
 # Phase 1G — CSV Export Architecture Plan
 
-**Status:** `IMPLEMENTED — READY TO COMMIT`
+**Status:** `COMPLETE / PUSHED / DEPLOYED / PRODUCTION VERIFIED`
 
 ## 1. Exact Phase 1G Scope
 - **Exported Entity:** `Transaction` only. `SavingsGoal` and internal database IDs (e.g., `id`) are excluded to maintain a flat ledger structure.
