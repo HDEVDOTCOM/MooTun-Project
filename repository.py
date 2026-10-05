@@ -1,17 +1,19 @@
 """Repository operations for transactions and savings goals.
 
-Every public query requires ``line_user_id`` so one LINE user's data cannot be
-returned or modified through another user's request.
+User operations are scoped by ``line_user_id``. Export downloads instead use a
+hashed capability joined to its owner's transactions in one SQL statement.
 """
 
 from __future__ import annotations
 
+import secrets
 from calendar import monthrange
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from database import init_db, session_scope
 from models import (
+    ExportToken,
     PendingAction,
     PendingTransaction,
     ProcessedWebhookEvent,
@@ -37,6 +40,7 @@ PENDING_ACTION_TTL = timedelta(minutes=10)
 CONFIRM_DELETE_TTL = timedelta(minutes=10)
 CONFIRM_DELETE_ALL_TTL = timedelta(minutes=10)
 UNDO_DELETE_TTL = timedelta(minutes=10)
+EXPORT_TOKEN_TTL = timedelta(minutes=10)
 
 # ``PendingAction.target_transaction_id`` is a non-nullable INTEGER with no
 # positive-only constraint.  Delete-all has no single target, so it uses this
@@ -85,6 +89,7 @@ class UserDataSummary:
     has_savings_goal: bool
     has_pending_transaction: bool
     has_pending_action: bool
+    has_live_export_token: bool
 
     @property
     def has_any_data(self) -> bool:
@@ -93,6 +98,7 @@ class UserDataSummary:
             or self.has_savings_goal
             or self.has_pending_transaction
             or self.has_pending_action
+            or self.has_live_export_token
         )
 
 
@@ -156,6 +162,76 @@ def add_transaction(
         db.add(item)
         db.flush()
     return item
+
+
+def create_export_token(
+    line_user_id: str,
+    *,
+    now: datetime,
+    session: Session | None = None,
+) -> str | None:
+    """Issue a ten-minute capability only when the user has transactions.
+
+    The raw token is returned for the reply URL, which may be persisted in the
+    webhook response cache. The ExportToken table stores only its hash.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    current_time = (
+        now.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None
+        else now.astimezone(timezone.utc)
+    )
+    with _session_context(session) as db:
+        count = db.scalar(
+            select(func.count(Transaction.id)).where(Transaction.line_user_id == user_id)
+        )
+        if not count:
+            return None
+        raw_token = secrets.token_urlsafe(32)
+        db.add(
+            ExportToken(
+                token_hash=sha256(raw_token.encode("utf-8")).hexdigest(),
+                line_user_id=user_id,
+                created_at=current_time,
+                expires_at=current_time + EXPORT_TOKEN_TTL,
+            )
+        )
+        db.flush()
+        return raw_token
+
+
+def fetch_export_transactions(
+    token_hash: str,
+    *,
+    now: datetime,
+    session: Session | None = None,
+) -> list[Transaction]:
+    """Authorize and read live data in ONE statement-level snapshot.
+
+    Never split this join into token lookup followed by a transaction query:
+    Delete All revocation must also protect subsequently created transactions.
+    Empty data and unauthorized capabilities both return an empty list.
+    """
+
+    current_time = (
+        now.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None
+        else now.astimezone(timezone.utc)
+    )
+    statement = (
+        select(Transaction)
+        .join(ExportToken, ExportToken.line_user_id == Transaction.line_user_id)
+        .where(ExportToken.token_hash == token_hash, ExportToken.expires_at > current_time)
+        .order_by(
+            Transaction.occurred_on.asc(),
+            Transaction.created_at.asc(),
+            Transaction.id.asc(),
+        )
+    )
+    with _session_context(session) as db:
+        with db.no_autoflush:
+            return list(db.scalars(statement).all())
 
 
 def list_recent_transactions(
@@ -887,7 +963,7 @@ def execute_delete_all(
 
     The confirmation row is deleted with identity/version/type/expiry OCC
     guards.  Only when that succeeds are the user's transactions, savings goal,
-    pending draft, and any remaining action removed, all in the same
+    pending draft, and export capabilities removed, all in the same
     transaction and every statement scoped by ``line_user_id``.  Global
     webhook-idempotency records are deliberately never touched.
     """
@@ -913,7 +989,7 @@ def execute_delete_all(
             raise PendingActionConflictError(
                 "pending action changed during delete-all"
             )
-        for model in (PendingTransaction, SavingsGoal, Transaction):
+        for model in (PendingTransaction, SavingsGoal, Transaction, ExportToken):
             db.execute(
                 delete(model)
                 .where(model.line_user_id == user_id)
@@ -923,11 +999,20 @@ def execute_delete_all(
 
 
 def get_user_data_summary(
-    line_user_id: str, *, session: Session | None = None
+    line_user_id: str,
+    *,
+    now: datetime | None = None,
+    session: Session | None = None,
 ) -> UserDataSummary:
     """Report whether a user still has anything delete-all would remove."""
 
     user_id = _validate_user_id(line_user_id)
+    current_time = now or datetime.now(timezone.utc)
+    current_time = (
+        current_time.replace(tzinfo=timezone.utc)
+        if current_time.tzinfo is None
+        else current_time.astimezone(timezone.utc)
+    )
     with _session_context(session) as db:
         transaction_count = int(
             db.scalar(
@@ -945,11 +1030,18 @@ def get_user_data_summary(
         )
         has_draft = db.get(PendingTransaction, user_id) is not None
         has_action = db.get(PendingAction, user_id) is not None
+        has_live_export_token = db.scalar(
+            select(ExportToken.id).where(
+                ExportToken.line_user_id == user_id,
+                ExportToken.expires_at > current_time,
+            ).limit(1)
+        ) is not None
     return UserDataSummary(
         transaction_count=transaction_count,
         has_savings_goal=has_goal,
         has_pending_transaction=has_draft,
         has_pending_action=has_action,
+        has_live_export_token=has_live_export_token,
     )
 
 

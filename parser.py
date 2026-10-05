@@ -36,6 +36,7 @@ class CommandKind(str, Enum):
     MONTHLY_SUMMARY = "monthly_summary"
     DELETE_LATEST = "delete_latest"
     DELETE_ALL = "delete_all"
+    EXPORT = "export"
     EDIT_LATEST = "edit_latest"
     SET_SAVINGS_GOAL = "set_savings_goal"
     ADD_SAVINGS = "add_savings"
@@ -451,6 +452,8 @@ def _parse_command_core(text: str, now: datetime | date | None = None) -> Parsed
 
     # Specific commands must be checked before their shorter words (for
     # example, ลบล่าสุด contains ล่าสุด).
+    if normalized == "ส่งออกข้อมูล":
+        return SimpleCommand(CommandKind.EXPORT)
     if normalized in {"ลบข้อมูลทั้งหมด"}:
         return SimpleCommand(CommandKind.DELETE_ALL)
     if normalized in {"ลบล่าสุด", "ลบรายการล่าสุด"}:

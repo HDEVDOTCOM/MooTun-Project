@@ -66,6 +66,18 @@ class Transaction(Base):
         return Decimal(self.amount_satang) / Decimal(100)
 
 
+class ExportToken(Base):
+    """Revocable export capability; only its SHA-256 hash is stored here."""
+
+    __tablename__ = "export_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    line_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PendingTransaction(Base):
     __tablename__ = "pending_transactions"
     __table_args__ = (

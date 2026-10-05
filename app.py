@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import Response
 from dotenv import load_dotenv
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
@@ -26,6 +32,9 @@ from messages import (
     format_delete_not_confirmed_yet,
     format_delete_success,
     format_edit_confirmation,
+    format_export_link,
+    format_export_no_data,
+    format_export_unavailable,
     format_help_message,
     format_monthly_summary,
     format_invalid_followup,
@@ -63,11 +72,13 @@ from repository import (
     add_savings_progress,
     add_transaction,
     confirm_delete_transaction,
+    create_export_token,
     create_pending_action,
     create_pending_transaction,
     delete_pending_action,
     delete_pending_transaction,
     execute_delete_all,
+    fetch_export_transactions,
     get_latest_transaction,
     get_pending_action,
     get_savings_goal,
@@ -99,6 +110,33 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 
+def _export_base_url() -> str | None:
+    """Validate the configured HTTPS base; there is no development fallback."""
+
+    value = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+        valid = (
+            value.startswith("https://")
+            and bool(parts.hostname)
+            and parts.username is None
+            and parts.password is None
+            and "?" not in value
+            and "#" not in value
+            and not any(character.isspace() or ord(character) < 32 for character in value)
+            and "\\" not in value
+        )
+        # Accessing port also validates malformed/out-of-range ports.
+        parts.port
+    except ValueError:
+        valid = False
+    if not valid:
+        raise RuntimeError("RENDER_EXTERNAL_URL must be a valid https:// URL")
+    return value.rstrip("/")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     if os.getenv("ENVIRONMENT") == "production":
@@ -108,11 +146,13 @@ async def lifespan(_: FastAPI):
                 "LINE_CHANNEL_SECRET",
                 "LINE_CHANNEL_ACCESS_TOKEN",
                 "DATABASE_URL",
+                "RENDER_EXTERNAL_URL",
             )
             if not os.getenv(name)
         ]
         if missing:
             raise RuntimeError(f"Missing production environment variables: {', '.join(missing)}")
+    _export_base_url()
     init_db()
     yield
 
@@ -167,6 +207,18 @@ def handle_text_message(
 
     processing_time = _utc_now()
     normalized_text = text.strip().lower()
+
+    # Export must not touch draft/action reads that can perform expiry cleanup.
+    if normalized_text == "ส่งออกข้อมูล":
+        command = parse_command(text, now=event_time)
+        if isinstance(command, SimpleCommand) and command.kind == CommandKind.EXPORT:
+            base_url = _export_base_url()
+            if base_url is None:
+                return format_export_unavailable()
+            token = create_export_token(line_user_id, now=processing_time, session=session)
+            if token is None:
+                return format_export_no_data()
+            return format_export_link(f"{base_url}/export/{token}")
 
     try:
         action_result = get_pending_action(
@@ -501,7 +553,7 @@ def handle_text_message(
         return format_recent_transactions([_transaction_data(item) for item in items])
 
     if command.kind == CommandKind.DELETE_ALL:
-        summary = get_user_data_summary(line_user_id, session=session)
+        summary = get_user_data_summary(line_user_id, now=processing_time, session=session)
         if not summary.has_any_data:
             return format_delete_all_no_data()
         if action is not None:
@@ -578,6 +630,58 @@ def handle_text_message(
         return format_savings_goal(_goal_data(goal))
 
     return format_unknown_message()
+
+
+def _safe_csv_text(value: str | None) -> str:
+    text = value or ""
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
+# The fallback also sends slash-containing malformed tokens through the same
+# fixed 404 response, including its no-store/nosniff headers.
+@app.get("/export/{token:path}", include_in_schema=False)
+@app.get("/export/{token}")
+def download_export(token: str) -> Response:
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+
+    def not_found() -> Response:
+        return Response(
+            content=b'{"detail":"Not Found"}',
+            status_code=404,
+            media_type="application/json",
+            headers=headers,
+        )
+
+    # token_urlsafe(32) produces 43 unpadded URL-safe base64 characters.
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
+        return not_found()
+
+    token_hash = sha256(token.encode("utf-8")).hexdigest()
+    with session_scope() as session:
+        items = fetch_export_transactions(token_hash, now=_utc_now(), session=session)
+        if not items:
+            return not_found()
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(["วันที่", "ประเภท", "หมวดหมู่", "รายการ", "จำนวนเงิน", "บันทึกเมื่อ"])
+        for item in items:
+            created_at = item.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            writer.writerow([
+                item.occurred_on.isoformat(),
+                "รายรับ" if item.transaction_type == "income" else "รายจ่าย",
+                _safe_csv_text(item.category),
+                _safe_csv_text(item.description),
+                f"{item.amount:.2f}",
+                created_at.astimezone(BANGKOK).isoformat(),
+            ])
+        content = output.getvalue().encode("utf-8-sig")
+
+    headers["Content-Disposition"] = 'attachment; filename="mootoon_export.csv"'
+    return Response(content=content, media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @app.get("/")
