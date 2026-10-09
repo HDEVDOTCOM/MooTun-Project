@@ -31,6 +31,7 @@ from models import (
     ProcessedWebhookEvent,
     SavingsGoal,
     Transaction,
+    UserFeedback,
 )
 
 
@@ -90,6 +91,7 @@ class UserDataSummary:
     has_pending_transaction: bool
     has_pending_action: bool
     has_live_export_token: bool
+    has_feedback: bool
 
     @property
     def has_any_data(self) -> bool:
@@ -99,6 +101,7 @@ class UserDataSummary:
             or self.has_pending_transaction
             or self.has_pending_action
             or self.has_live_export_token
+            or self.has_feedback
         )
 
 
@@ -162,6 +165,66 @@ def add_transaction(
         db.add(item)
         db.flush()
     return item
+
+
+def add_user_feedback(
+    line_user_id: str,
+    rating: int,
+    *,
+    comment: str | None = None,
+    expected_action_id: str | None = None,
+    expected_version: int | None = None,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> UserFeedback:
+    """Append feedback, atomically invalidating an observed delete-all action.
+
+    An observation of ACTIVE confirm_delete_all must carry its exact identity
+    and version. An OCC loser inserts nothing and must never retry against a
+    replacement action. Other actions and drafts are deliberately untouched.
+    The caller's outer transaction owns both invalidation and insertion.
+    """
+
+    user_id = _validate_user_id(line_user_id)
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
+        raise ValueError("rating must be an integer from 1 to 5")
+    comment_value = comment.strip() if comment is not None else None
+    if comment_value is not None and len(comment_value) > 1000:
+        raise ValueError("comment cannot exceed 1000 characters")
+    if (expected_action_id is None) != (expected_version is None):
+        raise ValueError("expected_action_id and expected_version must be supplied together")
+    current_time = now or datetime.now(timezone.utc)
+    current_time = (
+        current_time.replace(tzinfo=timezone.utc)
+        if current_time.tzinfo is None
+        else current_time.astimezone(timezone.utc)
+    )
+    with _session_context(session) as db:
+        if expected_action_id is not None:
+            consumed = db.execute(
+                delete(PendingAction)
+                .where(
+                    PendingAction.line_user_id == user_id,
+                    PendingAction.action_id == expected_action_id,
+                    PendingAction.version == expected_version,
+                    PendingAction.action_type == "confirm_delete_all",
+                    PendingAction.expires_at > current_time,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if consumed.rowcount == 0:
+                raise PendingActionConflictError(
+                    "pending action changed during feedback insertion"
+                )
+        feedback = UserFeedback(
+            line_user_id=user_id,
+            rating=rating,
+            comment=comment_value or None,
+            created_at=current_time,
+        )
+        db.add(feedback)
+        db.flush()
+        return feedback
 
 
 def create_export_token(
@@ -963,7 +1026,7 @@ def execute_delete_all(
 
     The confirmation row is deleted with identity/version/type/expiry OCC
     guards.  Only when that succeeds are the user's transactions, savings goal,
-    pending draft, and export capabilities removed, all in the same
+    pending draft, export capabilities, and feedback removed, all in the same
     transaction and every statement scoped by ``line_user_id``.  Global
     webhook-idempotency records are deliberately never touched.
     """
@@ -989,7 +1052,7 @@ def execute_delete_all(
             raise PendingActionConflictError(
                 "pending action changed during delete-all"
             )
-        for model in (PendingTransaction, SavingsGoal, Transaction, ExportToken):
+        for model in (PendingTransaction, SavingsGoal, Transaction, ExportToken, UserFeedback):
             db.execute(
                 delete(model)
                 .where(model.line_user_id == user_id)
@@ -1036,12 +1099,16 @@ def get_user_data_summary(
                 ExportToken.expires_at > current_time,
             ).limit(1)
         ) is not None
+        has_feedback = db.scalar(
+            select(UserFeedback.id).where(UserFeedback.line_user_id == user_id).limit(1)
+        ) is not None
     return UserDataSummary(
         transaction_count=transaction_count,
         has_savings_goal=has_goal,
         has_pending_transaction=has_draft,
         has_pending_action=has_action,
         has_live_export_token=has_live_export_token,
+        has_feedback=has_feedback,
     )
 
 

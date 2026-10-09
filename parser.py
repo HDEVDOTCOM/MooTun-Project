@@ -37,6 +37,7 @@ class CommandKind(str, Enum):
     DELETE_LATEST = "delete_latest"
     DELETE_ALL = "delete_all"
     EXPORT = "export"
+    FEEDBACK = "feedback"
     EDIT_LATEST = "edit_latest"
     SET_SAVINGS_GOAL = "set_savings_goal"
     ADD_SAVINGS = "add_savings"
@@ -97,6 +98,26 @@ class UnresolvedEditCommand(UnresolvedCommand):
 
 
 @dataclass(frozen=True)
+class FeedbackCommand:
+    kind: CommandKind
+    rating: int
+    comment: str | None
+
+
+class FeedbackError(str, Enum):
+    INSTRUCTION = "instruction"
+    INVALID_RATING = "invalid_rating"
+    COMMENT_TOO_LONG = "comment_too_long"
+
+
+@dataclass(frozen=True)
+class InvalidFeedbackCommand:
+    """Recognized feedback intent, never evidence for a financial follow-up."""
+
+    error: FeedbackError
+
+
+@dataclass(frozen=True)
 class IncompleteCommand:
     transaction_type: TransactionType | None
     amount: Decimal | None
@@ -114,6 +135,8 @@ ParsedCommand: TypeAlias = (
     | SavingsGoalCommand
     | SavingsProgressCommand
     | UnresolvedCommand
+    | FeedbackCommand
+    | InvalidFeedbackCommand
 )
 
 
@@ -157,6 +180,7 @@ _CLAUSE_NEGATED_ACTION_PATTERN = (
 # Phase 1C edit prefixes demand whitespace so ordinary items such as "แก้ว 60"
 # or "แก้ข้าว 60" are never reinterpreted as edits. "แก้ไข " is matched first.
 _EDIT_PREFIX_PATTERN = re.compile(r"^(แก้ไข|แก้)\s+")
+_FEEDBACK_PATTERN = re.compile(r"เสนอแนะ(?:\s+(\S+))?(?:\s+([\s\S]*))?")
 
 
 def _local_date(now: datetime | date | None) -> date:
@@ -437,6 +461,23 @@ def _parse_edit_command(text: str, now: datetime | date | None) -> ParsedCommand
     )
 
 
+def _parse_feedback(text: str) -> FeedbackCommand | InvalidFeedbackCommand:
+    """Capture the original remainder without collapsing internal whitespace."""
+
+    match = _FEEDBACK_PATTERN.fullmatch(text)
+    if match is None:
+        return InvalidFeedbackCommand(FeedbackError.INVALID_RATING)
+    rating_token, remainder = match.groups()
+    if rating_token is None:
+        return InvalidFeedbackCommand(FeedbackError.INSTRUCTION)
+    if re.fullmatch(r"[1-5]", rating_token) is None:
+        return InvalidFeedbackCommand(FeedbackError.INVALID_RATING)
+    comment = remainder.strip() if remainder is not None else None
+    if comment is not None and len(comment) > 1000:
+        return InvalidFeedbackCommand(FeedbackError.COMMENT_TOO_LONG)
+    return FeedbackCommand(CommandKind.FEEDBACK, int(rating_token), comment or None)
+
+
 def _parse_command_core(text: str, now: datetime | date | None = None) -> ParsedCommand:
     """Parse one Thai chat message into a typed command.
 
@@ -444,6 +485,11 @@ def _parse_command_core(text: str, now: datetime | date | None = None) -> Parsed
     datetimes are converted to Asia/Bangkok; naive datetimes are interpreted as
     Bangkok local time.
     """
+
+    original = text.strip()
+    # Even malformed syntax under this exact intent must not become a transaction.
+    if original.startswith("เสนอแนะ"):
+        return _parse_feedback(original)
 
     normalized = _normalize(text)
     display_text = _display_text(text)
@@ -634,7 +680,10 @@ def parse_followup(
     evidence = parse_command(text, now=now)
     if isinstance(
         evidence,
-        (SimpleCommand, SavingsGoalCommand, SavingsProgressCommand, EditLatestCommand),
+        (
+            SimpleCommand, SavingsGoalCommand, SavingsProgressCommand, EditLatestCommand,
+            FeedbackCommand, InvalidFeedbackCommand,
+        ),
     ):
         return _unresolved("ยังไม่มีข้อมูลธุรกรรมที่ใช้เติมรายการ")
     if isinstance(evidence, UnresolvedCommand):
@@ -732,7 +781,10 @@ __all__ = [
     "EDIT_MISSING_DETAILS_REASON",
     "EditLatestCommand",
     "FOLLOWUP_CONFLICT_REASON",
+    "FeedbackCommand",
+    "FeedbackError",
     "IncompleteCommand",
+    "InvalidFeedbackCommand",
     "ParsedCommand",
     "SavingsGoalCommand",
     "SavingsProgressCommand",

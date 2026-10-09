@@ -35,6 +35,10 @@ from messages import (
     format_export_link,
     format_export_no_data,
     format_export_unavailable,
+    format_feedback_comment_too_long,
+    format_feedback_instruction,
+    format_feedback_invalid_rating,
+    format_feedback_success,
     format_help_message,
     format_monthly_summary,
     format_invalid_followup,
@@ -53,7 +57,10 @@ from parser import (
     CommandKind,
     EditLatestCommand,
     FOLLOWUP_CONFLICT_REASON,
+    FeedbackCommand,
+    FeedbackError,
     IncompleteCommand,
+    InvalidFeedbackCommand,
     SavingsGoalCommand,
     SavingsProgressCommand,
     SimpleCommand,
@@ -71,6 +78,7 @@ from repository import (
     RestoreOutcome,
     add_savings_progress,
     add_transaction,
+    add_user_feedback,
     confirm_delete_transaction,
     create_export_token,
     create_pending_action,
@@ -355,6 +363,33 @@ def handle_text_message(
         return "ยกเลิกรายการที่ค้างไว้แล้วครับ"
 
     command = parse_command(text, now=event_time)
+
+    # Recognized feedback, including errors, never enters draft follow-up logic.
+    if isinstance(command, InvalidFeedbackCommand):
+        if command.error == FeedbackError.INSTRUCTION:
+            return format_feedback_instruction()
+        if command.error == FeedbackError.COMMENT_TOO_LONG:
+            return format_feedback_comment_too_long()
+        return format_feedback_invalid_rating()
+
+    if isinstance(command, FeedbackCommand):
+        try:
+            add_user_feedback(
+                line_user_id,
+                command.rating,
+                comment=command.comment,
+                expected_action_id=(
+                    pending_delete_all.action_id if pending_delete_all is not None else None
+                ),
+                expected_version=(
+                    pending_delete_all.version if pending_delete_all is not None else None
+                ),
+                now=_utc_now(),
+                session=session,
+            )
+        except PendingActionConflictError:
+            return PENDING_ACTION_RETRY_REPLY
+        return format_feedback_success(command.rating)
 
     if isinstance(command, UnresolvedEditCommand):
         return format_unknown_message(command.reason)

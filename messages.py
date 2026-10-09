@@ -333,6 +333,31 @@ def format_invalid_followup() -> str:
     return 'ยังบันทึกไม่ได้ครับ กรุณาระบุข้อมูลที่ขาด หรือพิมพ์ "ยกเลิก"'
 
 
+def format_feedback_success(rating: int) -> str:
+    return limit_line_text(
+        f"บันทึกข้อเสนอแนะระดับ {rating} ดาวเรียบร้อย ขอบคุณที่ช่วยพัฒนาหมูตุ๋นครับ 🐷"
+    )
+
+
+def format_feedback_instruction() -> str:
+    return limit_line_text(
+        "หากต้องการส่งข้อเสนอแนะ กรุณาพิมพ์ 'เสนอแนะ [คะแนน 1-5]' "
+        "หรือ 'เสนอแนะ [คะแนน] [ข้อความ]' เช่น:\n"
+        "- เสนอแนะ 5\n- เสนอแนะ 4 ใช้ง่ายดีครับ"
+    )
+
+
+def format_feedback_invalid_rating() -> str:
+    return "คะแนนข้อเสนอแนะต้องเป็นตัวเลข 1 ถึง 5 เท่านั้นครับ เช่น 'เสนอแนะ 5'"
+
+
+def format_feedback_comment_too_long() -> str:
+    return (
+        "ข้อความเสนอแนะยาวเกินไป (สูงสุด 1000 ตัวอักษร) "
+        "กรุณาสรุปข้อความแล้วส่งใหม่อีกครั้งครับ"
+    )
+
+
 def format_export_link(url: str) -> str:
     return f"ดาวน์โหลดข้อมูลรายการเป็น CSV ได้ที่ลิงก์นี้ครับ (ลิงก์มีอายุ 10 นาที)\n{url}"
 

@@ -176,6 +176,23 @@ class SavingsGoal(Base):
         return max(self.target_amount - self.saved_amount, Decimal("0.00"))
 
 
+class UserFeedback(Base):
+    __tablename__ = "user_feedback"
+    __table_args__ = (
+        CheckConstraint(
+            "rating >= 1 AND rating <= 5", name="ck_user_feedback_valid_rating"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    line_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    comment: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
 class ProcessedWebhookEvent(Base):
     """Durable idempotency record for a LINE webhook event."""
 
