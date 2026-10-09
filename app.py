@@ -41,6 +41,8 @@ from messages import (
     format_feedback_success,
     format_help_message,
     format_monthly_summary,
+    format_onboarding_usage,
+    format_onboarding_welcome,
     format_invalid_followup,
     format_pending_conflict,
     format_pending_transaction_prompt,
@@ -61,6 +63,7 @@ from parser import (
     FeedbackError,
     IncompleteCommand,
     InvalidFeedbackCommand,
+    InvalidOnboardingCommand,
     SavingsGoalCommand,
     SavingsProgressCommand,
     SimpleCommand,
@@ -69,6 +72,7 @@ from parser import (
     UnresolvedEditCommand,
     parse_command,
     parse_followup,
+    parse_onboarding,
 )
 from repository import (
     DELETE_ALL_TARGET_SENTINEL,
@@ -227,6 +231,13 @@ def handle_text_message(
             if token is None:
                 return format_export_no_data()
             return format_export_link(f"{base_url}/export/{token}")
+
+    # Onboarding must avoid financial parsing and even lazy pending expiry reads.
+    onboarding = parse_onboarding(text)
+    if isinstance(onboarding, InvalidOnboardingCommand):
+        return format_onboarding_usage()
+    if onboarding is not None:
+        return format_onboarding_welcome()
 
     try:
         action_result = get_pending_action(
@@ -769,15 +780,18 @@ async def line_webhook(
         reply_token = event.get("replyToken")
         source = event.get("source", {})
         message = event.get("message", {})
+        event_type = event.get("type")
 
         if (
             not isinstance(event_id, str)
-            or event.get("type") != "message"
+            or event_type not in ("message", "follow")
             or not isinstance(source, dict)
             or source.get("type") != "user"
             or not isinstance(source.get("userId"), str)
-            or not isinstance(message, dict)
-            or message.get("type") != "text"
+        ):
+            continue
+        if event_type == "message" and (
+            not isinstance(message, dict) or message.get("type") != "text"
         ):
             continue
 
@@ -790,12 +804,15 @@ async def line_webhook(
             else:
                 if not mark_webhook_processed(event_id, session=session):
                     continue
-                response_text = handle_text_message(
-                    source["userId"],
-                    str(message.get("text", "")),
-                    _event_datetime(event.get("timestamp")),
-                    session,
-                )
+                if event_type == "follow":
+                    response_text = format_onboarding_welcome()
+                else:
+                    response_text = handle_text_message(
+                        source["userId"],
+                        str(message.get("text", "")),
+                        _event_datetime(event.get("timestamp")),
+                        session,
+                    )
                 set_webhook_response(event_id, response_text, session=session)
 
         if isinstance(reply_token, str) and reply_token:

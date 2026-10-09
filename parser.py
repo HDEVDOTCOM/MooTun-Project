@@ -38,6 +38,7 @@ class CommandKind(str, Enum):
     DELETE_ALL = "delete_all"
     EXPORT = "export"
     FEEDBACK = "feedback"
+    ONBOARDING = "onboarding"
     EDIT_LATEST = "edit_latest"
     SET_SAVINGS_GOAL = "set_savings_goal"
     ADD_SAVINGS = "add_savings"
@@ -71,6 +72,11 @@ class EditLatestCommand:
 @dataclass(frozen=True)
 class SimpleCommand:
     kind: CommandKind
+
+
+@dataclass(frozen=True)
+class InvalidOnboardingCommand:
+    """Recognized onboarding intent with arguments, never financial evidence."""
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,7 @@ ParsedCommand: TypeAlias = (
     | UnresolvedCommand
     | FeedbackCommand
     | InvalidFeedbackCommand
+    | InvalidOnboardingCommand
 )
 
 
@@ -415,6 +422,20 @@ EDIT_MISSING_DETAILS_REASON = "กรุณาระบุข้อมูลใ�
 EDIT_INCOMPLETE_REASON = "คำสั่งแก้ไขต้องระบุรายการและจำนวนเงินให้ครบในข้อความเดียวครับ"
 
 
+def parse_onboarding(text: str) -> SimpleCommand | InvalidOnboardingCommand | None:
+    """Recognize only the original keyword or its whitespace-delimited usage."""
+
+    original = text.strip()
+    keyword = "เริ่มใช้งาน"
+    if original == keyword:
+        return SimpleCommand(CommandKind.ONBOARDING)
+    if original.startswith(keyword):
+        remainder = original[len(keyword):]
+        if remainder and remainder[0].isspace():
+            return InvalidOnboardingCommand()
+    return None
+
+
 def parse_command(text: str, now: datetime | date | None = None) -> ParsedCommand:
     """Parse one Thai chat message into a typed command.
 
@@ -485,6 +506,10 @@ def _parse_command_core(text: str, now: datetime | date | None = None) -> Parsed
     datetimes are converted to Asia/Bangkok; naive datetimes are interpreted as
     Bangkok local time.
     """
+
+    onboarding = parse_onboarding(text)
+    if onboarding is not None:
+        return onboarding
 
     original = text.strip()
     # Even malformed syntax under this exact intent must not become a transaction.
@@ -682,7 +707,7 @@ def parse_followup(
         evidence,
         (
             SimpleCommand, SavingsGoalCommand, SavingsProgressCommand, EditLatestCommand,
-            FeedbackCommand, InvalidFeedbackCommand,
+            FeedbackCommand, InvalidFeedbackCommand, InvalidOnboardingCommand,
         ),
     ):
         return _unresolved("ยังไม่มีข้อมูลธุรกรรมที่ใช้เติมรายการ")
@@ -785,6 +810,7 @@ __all__ = [
     "FeedbackError",
     "IncompleteCommand",
     "InvalidFeedbackCommand",
+    "InvalidOnboardingCommand",
     "ParsedCommand",
     "SavingsGoalCommand",
     "SavingsProgressCommand",
@@ -794,4 +820,5 @@ __all__ = [
     "UnresolvedEditCommand",
     "parse_command",
     "parse_followup",
+    "parse_onboarding",
 ]
