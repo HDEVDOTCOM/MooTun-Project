@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="MooTun ดูข้อมูลผ่าน LINE">
+  <title>MooTun — ดูข้อมูล</title>
+  <link rel="stylesheet" href="/app/assets/styles.css">
+  <!-- Fixed SDK 2.31.2: reviewed LINE release notes (2026-10-07) and init origins. -->
+  <script defer src="https://static.line-scdn.net/liff/edge/versions/2.31.2/sdk.js"></script>
+  <script defer src="/app/assets/app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>MooTun</h1>
+    <p>ดูข้อมูลของคุณ · Developing · อ่านอย่างเดียว</p>
+    <nav aria-label="ส่วนข้อมูล">
+      <a href="#summary">สรุป</a><a href="#transactions">รายการ</a>
+      <a href="#savings">การออม</a><a href="#help">ช่วยเหลือ / ความเป็นส่วนตัว</a>
+    </nav>
+  </header>
+  <main>
+    <p id="status" role="status" aria-live="polite">กำลังเชื่อมต่อ LINE…</p>
+    <div class="actions">
+      <button id="login" type="button" hidden>เข้าสู่ระบบ LINE</button>
+      <button id="refresh" type="button">ลองอีกครั้ง / รีเฟรช</button>
+    </div>
+    <section id="summary" aria-labelledby="summary-title">
+      <h2 id="summary-title">สรุปเดือนนี้</h2>
+      <div id="summary-data" aria-live="polite">กำลังโหลดข้อมูล…</div>
+    </section>
+    <section id="transactions" aria-labelledby="transactions-title">
+      <h2 id="transactions-title">ห้ารายการล่าสุด</h2>
+      <p>เรียงตามวันที่รายการ ไม่ใช่ประวัติทั้งหมด</p>
+      <div id="transactions-data" aria-live="polite">กำลังโหลดข้อมูล…</div>
+    </section>
+    <section id="savings" aria-labelledby="savings-title">
+      <h2 id="savings-title">เป้าหมายการออม</h2>
+      <div id="savings-data" aria-live="polite">กำลังโหลดข้อมูล…</div>
+    </section>
+    <section id="help" aria-labelledby="help-title">
+      <h2 id="help-title">ช่วยเหลือ / ความเป็นส่วนตัว</h2>
+      <p>หน้านี้แสดงข้อมูล MooTun ที่มีอยู่แล้วเท่านั้น การบันทึก แก้ไข ลบ และลบทั้งหมดทำผ่านแชตกับน้องหมูตุ๋น</p>
+      <p>ใช้การยืนยันตัวตน LINE เพื่อเรียกดูเฉพาะข้อมูลของคุณ ไม่ขอชื่อ รูปโปรไฟล์ หรืออีเมล</p>
+      <p>หน้านี้ไม่บันทึกสำเนาโทเคนหรือข้อมูลการเงินลงพื้นที่จัดเก็บถาวรของเบราว์เซอร์ การจัดเก็บภายใน LINE / LIFF เป็นไปตามการทำงานของแพลตฟอร์ม</p>
+      <p>การเก็บบันทึกการทำงานของระบบยังเป็นไปตามแนวทางเดิม ไม่มีการกำหนดระยะเวลาเก็บข้อมูลใหม่จากหน้านี้ การปิดหน้านี้ไม่ได้รับประกันว่าออกจากระบบ LINE</p>
+      <p>แต่ละส่วนอ่านข้อมูลแยกกัน หากเพิ่งเปลี่ยนข้อมูลในแชต ให้กดรีเฟรช การออมแยกจากสุทธิรายรับรายจ่ายของเดือน และสุทธิเดือนนี้ไม่ใช่ยอดเงินในธนาคาร</p>
+    </section>
+    <noscript>กรุณาเปิด JavaScript เพื่อเชื่อมต่อ LINE หรือใช้งาน MooTun ผ่านแชต</noscript>
+  </main>
+</body>
+</html>

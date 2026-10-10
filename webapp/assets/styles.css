@@ -1,0 +1,22 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; color: #20372d; background: #f3f6f4; }
+* { box-sizing: border-box; }
+body { margin: 0; line-height: 1.65; overflow-wrap: anywhere; }
+header, main { max-width: 46rem; margin: auto; padding: 1rem; }
+h1, h2, h3 { line-height: 1.4; }
+header p { margin-top: 0; }
+nav, .actions { display: flex; flex-wrap: wrap; gap: .65rem; }
+a, button { min-height: 44px; padding: .65rem .9rem; border-radius: .5rem; }
+a { color: #125f40; background: #e3eee6; }
+button { color: white; background: #196646; border: 0; font: inherit; cursor: pointer; }
+button:disabled { opacity: .65; cursor: wait; }
+:focus-visible { outline: 3px solid #91520e; outline-offset: 3px; }
+[hidden] { display: none !important; }
+section { background: white; border: 1px solid #ccdcd1; border-radius: .8rem; padding: 1rem; margin: 1rem 0; scroll-margin-top: 1rem; }
+section h2 { margin-top: 0; }
+dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: .6rem; }
+dt, dd { margin: 0; }
+dd { text-align: right; font-weight: 600; }
+ul { padding-left: 1.4rem; }
+li { margin-bottom: 1rem; }
+.freshness { color: #4e6256; font-size: .9rem; }
+progress { width: 100%; height: 1.3rem; accent-color: #196646; }

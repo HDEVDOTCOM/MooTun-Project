@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from dotenv import load_dotenv
@@ -110,6 +111,8 @@ from repository import (
     update_latest_transaction,
     update_pending_transaction,
 )
+from webapp_auth import VERIFY_TIMEOUT_SECONDS, WebAccessLogFilter, WebAppConfig
+from webapp_routes import register_webapp
 
 
 logger = logging.getLogger("mootoon")
@@ -150,7 +153,7 @@ def _export_base_url() -> str | None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
     if os.getenv("ENVIRONMENT") == "production":
         missing = [
             name
@@ -166,10 +169,21 @@ async def lifespan(_: FastAPI):
             raise RuntimeError(f"Missing production environment variables: {', '.join(missing)}")
     _export_base_url()
     init_db()
-    yield
+    application.state.webapp_config = WebAppConfig.from_environment()
+    access_logger = logging.getLogger("uvicorn.access")
+    access_filter = WebAccessLogFilter()
+    access_logger.addFilter(access_filter)
+    try:
+        # HTTPX's default transport has no automatic retries. No credential cache.
+        async with httpx.AsyncClient(timeout=VERIFY_TIMEOUT_SECONDS) as client:
+            application.state.webapp_verify_client = client
+            yield
+    finally:
+        access_logger.removeFilter(access_filter)
 
 
 app = FastAPI(title="MooToon LINE Bot", lifespan=lifespan)
+register_webapp(app)
 
 
 def _transaction_data(item: Any) -> dict[str, Any]:
